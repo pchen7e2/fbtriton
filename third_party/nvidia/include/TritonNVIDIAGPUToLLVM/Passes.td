@@ -42,4 +42,32 @@ def ConvertWarpSpecializeToLLVM : Pass<"convert-warp-specialize-to-llvm", "mlir:
   let dependentDialects = ["mlir::LLVM::LLVMDialect", "mlir::NVVM::NVVMDialect"];
 }
 
+def SparseLocalLoadToLLVMPass
+    : Pass<"sparse-local-load-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Lowers sparse local load to LLVM";
+  let dependentDialects = [
+    "triton::gpu::TritonGPUDialect",
+    "mlir::LLVM::LLVMDialect"
+  ];
+  let constructor = "CreateSparseLocalLoadToLLVMPass()";
+}
+
+def SparseDotOpToLLVMPass : Pass<"sparse-dot-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Lowers sparse dot to LLVM";
+  let constructor = "CreateSparseDotOpToLLVMPass()";
+  let dependentDialects = [
+    "triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
+  ];
+}
+
+def SparseWGMMAOpToLLVMPass : Pass<"sparse-wgmma-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Lowers sparse WGMMA to LLVM";
+  let dependentDialects = [
+    "triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
+  ];
+  let constructor = "CreateSparseWGMMAOpToLLVMPass()";
+}
+
 #endif // TRITONGPU_CONVERSION_PASSES

@@ -1314,11 +1314,7 @@ def SparseDotMetaEncodingAttr : DistributedEncoding<"SparseDotMetaEncoding", "sp
 
   let parameters = (ins "Attribute":$parent);
   let assemblyFormat = "`<``{` struct(params) `}``>`";
-  let extraClassDeclaration = extraDistributedDeclaration # [{
-    SmallVector<unsigned> getContigPerThread() {
-      return getSizePerThread();
-    };
-  }];
+  let extraClassDeclaration = extraDistributedDeclaration;
 }
 
 def TTG_SharedMemorySpace : AttrDef<TritonGPU_Dialect, "SharedMemorySpace"> {

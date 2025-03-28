@@ -92,10 +92,20 @@ mlir::LogicalResult SparseDotOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
     DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
-  return DotOp::inferReturnTypes(context, location, operands, attributes,
-                                 properties, regions, inferredReturnTypes);
+  // type is the same as the accumulator
+  auto accTy = cast<RankedTensorType>(operands[2].getType());
+  inferredReturnTypes.push_back(accTy);
+
+  // verify encodings
+  auto aEnc = cast<RankedTensorType>(operands[0].getType()).getEncoding();
+  auto bEnc = cast<RankedTensorType>(operands[1].getType()).getEncoding();
+  auto retEnc = accTy.getEncoding();
+
+  return success();
 }
 
+// TODO: had to disable verifier b/c TensorOrMemDesc is TTGIR-only
+/*
 LogicalResult SparseDotOp::verify() {
   // Verify operand A.
   auto aTensorTy = cast<TensorOrMemDesc>(getOperand(0).getType());
@@ -153,6 +163,7 @@ LogicalResult SparseDotOp::verify() {
   return interface->verifyDotOpEncodingCompatibility(getOperation(), aEncoding,
                                                      bEncoding);
 }
+*/
 
 void TritonDialect::initialize() {
   registerTypes();

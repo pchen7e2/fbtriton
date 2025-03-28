@@ -712,6 +712,10 @@ def TT_DotScaledOp : TT_Op<"dot_scaled", [Pure,
 // Sparse Dot Op
 //
 // TODO(sparsity) do we need the verifier and the InferTypeOpInterface?
+// TODO(sparsity): InferTypeOpInterface is causing us problems:
+//                 why does it go to DotOp::inferReturnTypes?
+//                 Also, is it a problem that SparseDotOp does _not_ convert
+//                 inputs to DotOperandEncodingAttr?
 def TT_SparseDotOp : TT_Op<"sparse_dot", [Pure,
                              DeclareOpInterfaceMethods<DotOpInterface>,
                              DeclareOpInterfaceMethods<InferTypeOpInterface>,
@@ -736,7 +740,9 @@ def TT_SparseDotOp : TT_Op<"sparse_dot", [Pure,
     // attr-dict prints enums as integers.  To get inputPrecision printed as a
     // string, we need to specify it explicitly.
     let assemblyFormat = [{$a`,` $b`,` $c`,` $aMeta attr-dict `:` type($a) `meta` type($aMeta) `*` type($b) `->` type($d)}];
-    let hasVerifier = 1;
+
+    // TODO(sparsity): verifier disabled b/c TensorOrMemDesc is TTGIR-only
+    // let hasVerifier = 0;
 }
 
 //

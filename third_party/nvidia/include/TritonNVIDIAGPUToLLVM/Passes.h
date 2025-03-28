@@ -23,6 +23,15 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability);
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion);
 
+// TODO(sparsity): can we get rid of these??
+std::unique_ptr<mlir::Pass> CreateSparseAddEncodingPass(
+    int32_t num_warps = 4, int32_t threads_per_warp = 32, int32_t num_ctas = 1);
+std::unique_ptr<mlir::Pass> CreateSparseBlockedToMMAPass();
+std::unique_ptr<mlir::Pass> CreateSparseRemoveLayoutConversionPass();
+std::unique_ptr<mlir::Pass> CreateSparseLocalLoadToLLVMPass();
+std::unique_ptr<mlir::Pass> CreateSparseDotOpToLLVMPass();
+std::unique_ptr<mlir::Pass> CreateSparseWGMMAOpToLLVMPass();
+
 #define GEN_PASS_REGISTRATION
 #include "nvidia/include/TritonNVIDIAGPUToLLVM/Passes.h.inc"
 
