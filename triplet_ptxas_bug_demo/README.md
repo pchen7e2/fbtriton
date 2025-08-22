@@ -13,6 +13,7 @@ Some useful attachments:
 - baseline.ttgir: baseline ttgir w/o the hack. The perf is not as good as w/ the hack, but no NE.
 - hack_fail.ttgir: manually edited ttgir to reflect the essence of the hack. Useful to compare with baseline.ttgir. Perf is very good, but NE is large.
 - hack_pass.ttgir: compared to hack_fail.ttgir, enable only one ttg.local_alloc op (SMEM write) whose output is not used. It's supposed to be a no-op on accuracy, but it actually yielded a good NE and a bad perf.
+- hack_fail_dump: the IR and ptx/sass dumps when applying hack in compiler and just run the test script without manual override.
 
 Then to minimize the PTX difference, I moved two lines in the ttgir override to be closer to wgmma op:
 - hack_pass1.ttgir: moved three lines compared to hack_pass.ttgir. Good NE.
