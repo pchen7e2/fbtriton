@@ -3,9 +3,11 @@ Issue: ptxas optimizations cause a larger numerical error.
 Summary: In this [triplet kernel](https://github.com/meta-pytorch/AccelKernels/blob/14222fd1c4acc8f42fa5dbca4d8af77266b7f0d7/triplet_attention/triplet/ops/tlx/fwd_ws_pingpong.py#L3), we have a layout conversion for operand A from blocked layout to dot operand layout which involves an SMEM write+read. We did a [hack](https://github.com/facebookexperimental/triton/commit/515db4b16cf7ee11457f09261a79d591dbabbd4f) to eleminate these two and yielded a great perf win but notices large numerical errors on certain shapes. Forcing ptxas opt level to 0 will resolve the NE (but perf is a lot worse).
 
 How to reproduce:
-- Download and install this [kernel](https://github.com/meta-pytorch/AccelKernels/tree/14222fd1c4acc8f42fa5dbca4d8af77266b7f0d7/triplet_attention)
-- Download and install this Triton branch (based on late May upstream main branch) [link](https://github.com/facebookexperimental/triton/tree/tlx)
-- Run this [test](https://github.com/meta-pytorch/AccelKernels/blob/14222fd1c4acc8f42fa5dbca4d8af77266b7f0d7/triplet_attention/tests/test_tlx_fwd_ws_pingpong.py#L29) w/ and w/o the hack mentioned above.
+- Download and install this [kernel](https://github.com/meta-pytorch/AccelKernels/tree/14222fd1c4acc8f42fa5dbca4d8af77266b7f0d7/triplet_attention) (checkout commit 5b8f218cb3c1cb82b8e38902501f9cc668f823a9)
+- Download and install this Triton branch (based on late May upstream main branch) [link](https://github.com/facebookexperimental/triton/tree/tlx) (checkout commit 76b98297e061b158cbea6147cef1d1bd9e6d9f68)
+  - To apply the hack, apply this patch: https://github.com/facebookexperimental/triton/commit/515db4b16cf7ee11457f09261a79d591dbabbd4f
+- Run this [test](https://github.com/meta-pytorch/AccelKernels/blob/14222fd1c4acc8f42fa5dbca4d8af77266b7f0d7/triplet_attention/tests/test_tlx_fwd_ws_pingpong.py#L29) (`python test_tlx_fwd_ws_pingpong.py`) w/ and w/o the hack mentioned above. Test failing means NE is bad.
+- To check performance, run this [script](https://github.com/meta-pytorch/AccelKernels/blob/14222fd1c4acc8f42fa5dbca4d8af77266b7f0d7/triplet_attention/triplet/ops/tlx/fwd_ws_pingpong.py#L3) (`python fwd_ws_pingpong.py`)
 
 Some useful attachments:
 - baseline.ttgir: baseline ttgir w/o the hack. The perf is not as good as w/ the hack, but no NE.
