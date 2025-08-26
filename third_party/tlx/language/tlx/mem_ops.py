@@ -292,7 +292,9 @@ def local_store(
         src_handle = _builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
         return tl.tensor(_builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
-    return tl.tensor(_builder.create_local_store(dst.handle, src.handle), tl.void)
+    mma_layout = _builder.make_nv_mma_encoding_attr(src.handle, src.handle, 3, 0, _builder.options.num_warps)
+    src_handle = _builder.create_require_layout(src.handle, mma_layout)
+    return tl.tensor(_builder.create_local_store(dst.handle, src_handle), tl.void)
 
 
 @tl.builtin

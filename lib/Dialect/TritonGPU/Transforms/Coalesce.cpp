@@ -10,10 +10,13 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Debug.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 
 #define DEBUG_TYPE "tritongpu-coalesce"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+namespace tlx = mlir::triton::tlx;
 
 namespace mlir {
 namespace triton {
@@ -153,9 +156,43 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
     op->erase();
   }
 
+  // back propagate RankTensorType encoding
+  void setType(Value &src, Operation *op, SmallVector<Value> &queue){
+    for(int i = 0; i < op->getNumOperands(); i++){
+      auto dst = op->getOperand(i);
+
+    if (auto srcTensorType = dyn_cast<RankedTensorType>(src.getType())) {
+      auto dstTensorType = dyn_cast<RankedTensorType>(dst.getType());
+      if (dstTensorType && srcTensorType.getEncoding() != dstTensorType.getEncoding()) {
+        auto newType = RankedTensorType::get(dstTensorType.getShape(),
+        dstTensorType.getElementType(), srcTensorType.getEncoding());
+        dst.setType(newType);
+        queue.push_back(op->getOperand(i));
+      }
+    }
+  }
+  }
+
+  void hackRequireLayout(){
+    ModuleOp mod = getOperation();
+    mod.walk([&](LocalStoreOp op) {
+      // use a queue to keep a list of Value whose encoding has changed
+      // and we need to update their users
+      SmallVector<Value > queue;
+      Value seed = op.getSrc();
+      queue.push_back(seed);
+      while (!queue.empty()) {
+        Value v = queue.pop_back_val();
+        auto definingOp = v.getDefiningOp();
+        setType(v, definingOp, queue);
+      }
+    });
+  }
+
   void runOnOperation() override {
-    // Run axis info analysis
+    hackRequireLayout();
     ModuleOp moduleOp = getOperation();
+    // Run axis info analysis
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
     // For each i/o operation, we determine what layout
