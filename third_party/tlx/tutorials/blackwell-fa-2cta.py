@@ -21,10 +21,10 @@ def _host_descriptor_pre_hook(nargs):
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     nargs["desc_q"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
     if nargs["FP8_OUTPUT"]:
-        nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
+        nargs["desc_v"].block_shape = [HEAD_DIM // 2, BLOCK_N]
     else:
-        nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
+        nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM // 2]
+    nargs["desc_k"].block_shape = [BLOCK_N // 2, HEAD_DIM]
     nargs["desc_o"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
 
 
@@ -71,9 +71,13 @@ def _attn_fwd_ws(sm_scale, M,  #
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
 
+    cluster_cta_rank = tlx.cluster_cta_rank()
+    pred_cta0 = cluster_cta_rank == 0
+    cta_bars = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV, arrive_count=2)  # CTA0 waits for CTA1's data before mma
+
     # allocate SMEM buffers and barriers
     q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_MMA_GROUPS)
-    kv_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
+    kv_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM // 2), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
 
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     kv_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
@@ -221,8 +225,15 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # -- compute q @ k ----
                 # wait for the K buffer to be populated by the producer
                 tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
-                k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
+                k_tile_tmp = tlx.local_reinterpret(kv_tiles[k_bufIdx], kv_tiles[k_bufIdx].dtype,
+                                                   [BLOCK_N // 2, HEAD_DIM])
+                k_tile = tlx.local_trans(k_tile_tmp)
                 qk_bufIdx, qk_phase = _get_bufidx_phase(accum_cnt_qk, NUM_BUFFERS_QK)
+
+                cta_bar = tlx.remote_view(cta_bars[k_bufIdx], 0)
+                tlx.barrier_arrive(cta_bar, 1)
+                tlx.barrier_wait(cta_bar, phase=k_phase, pred=pred_cta0)
+
                 for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                     qk_bufIdx_2 = qk_bufIdx + cid * NUM_BUFFERS_QK
                     if cid == NUM_MMA_GROUPS - 1:
@@ -232,6 +243,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                             qk_tiles[qk_bufIdx_2],
                             use_acc=False,
                             mBarriers=[qk_fulls[qk_bufIdx_2], kv_empties[k_bufIdx]],
+                            two_ctas=True,
                         )
                     else:
                         tlx.async_dot(
@@ -240,11 +252,16 @@ def _attn_fwd_ws(sm_scale, M,  #
                             qk_tiles[qk_bufIdx_2],
                             use_acc=False,
                             mBarriers=[qk_fulls[qk_bufIdx_2]],
+                            two_ctas=True,
                         )
 
                 # -- compute p @ v ----
                 # wait for the V buffer to be populated by the producer
                 tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
+                # todo: re-think
+                cta_bar = tlx.remote_view(cta_bars[v_bufIdx], 0)
+                tlx.barrier_arrive(cta_bar, 1)
+                tlx.barrier_wait(cta_bar, phase=v_phase, pred=pred_cta0)
                 for cid in tl.range(0, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                     qk_bufIdx_2 = qk_bufIdx + cid * NUM_BUFFERS_QK
                     tlx.barrier_wait(p_fulls[qk_bufIdx_2], qk_phase)
@@ -258,6 +275,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                             acc_tiles[qk_bufIdx_2],
                             use_acc=i > 0,
                             mBarriers=[acc_empties[qk_bufIdx_2], kv_empties[v_bufIdx]],
+                            two_ctas=True,
                         )
                     else:
                         tlx.async_dot(
@@ -266,6 +284,7 @@ def _attn_fwd_ws(sm_scale, M,  #
                             acc_tiles[qk_bufIdx_2],
                             use_acc=i > 0,
                             mBarriers=[acc_empties[qk_bufIdx_2]],
+                            two_ctas=True,
                         )
 
                 accum_cnt_qk += 1
@@ -291,9 +310,10 @@ def _attn_fwd_ws(sm_scale, M,  #
                 tlx.barrier_wait(k_empty, k_phase ^ 1)
                 # load K
                 k_full = tlx.local_view(kv_fulls, k_bufIdx)
-                k_tile = tlx.local_view(kv_tiles, k_bufIdx)
-                tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * HEAD_DIM)  # float16
-                tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
+                k_tile_tmp = tlx.local_view(kv_tiles, k_bufIdx)
+                k_tile = tlx.local_reinterpret(k_tile_tmp, k_tile_tmp.dtype, [BLOCK_N // 2, HEAD_DIM])
+                tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * HEAD_DIM // 2)  # float16
+                tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y + cluster_cta_rank * (BLOCK_N // 2), 0], k_full)
 
                 v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                 # wait for the V buffer to be released by the consumer
@@ -302,8 +322,8 @@ def _attn_fwd_ws(sm_scale, M,  #
                 # load V
                 v_full = tlx.local_view(kv_fulls, v_bufIdx)
                 v_tile = tlx.local_view(kv_tiles, v_bufIdx)
-                tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * HEAD_DIM)  # float16
-                tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
+                tlx.barrier_expect_bytes(v_full, 2 * BLOCK_N * HEAD_DIM // 2)  # float16
+                tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, cluster_cta_rank * (HEAD_DIM // 2)], v_full)
 
                 kv_offset_y += BLOCK_N
                 accum_cnt_kv += 2
@@ -409,7 +429,6 @@ def test_op(Z, H, N_CTX, HEAD_DIM, mode, provider, dtype=torch.float16):
 try:
     from flash_attn.flash_attn_interface import \
         flash_attn_qkvpacked_func as flash_attn_func
-
     HAS_FLASH = True
 except BaseException:
     HAS_FLASH = False
