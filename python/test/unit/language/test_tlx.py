@@ -2392,15 +2392,23 @@ def test_descriptor_load_multicast(device):
         # Compute tile offset in global memory
         off_m = pid_m * BLOCK_SIZE_M
         off_n = pid_n * BLOCK_SIZE_N
-        if should_initiate_load:
-            # given CTA layout
-            # [ 0, 2 ]
-            # [ 1, 3 ]
-            # for CTA 0: we want it to multicast to CTA 0 and 2
-            # for CTA 3: we want it to multicast to CTA 1 and 3
-            tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar,
-                                      multicast_targets=[cta_id_m, cta_id_m + CLUSTER_SIZE_M])
+        # given CTA layout
+        # [ 0, 2 ]
+        # [ 1, 3 ]
+        # for CTA 0: we want it to multicast to CTA 0 and 2
+        # for CTA 3: we want it to multicast to CTA 1 and 3
+
+        # it seems deadlock is gone if we introduce any delay in thread 0 of at least one of the CTAs in the pairs
+        # if (tlx.thread_id(0) == 0 and cta_id_n == 0):
+        #     tl.device_print('before load')
+        tlx.cluster_barrier()
+        tlx.async_descriptor_load(desc_in, buffer, [off_m, off_n], bar,
+                                    multicast_targets=[cta_id_m, cta_id_m + CLUSTER_SIZE_M])
+        if tlx.thread_id(0) == 0:
+            tl.device_print('before wait')
         tlx.barrier_wait(bar=bar, phase=0)
+        if tlx.thread_id(0) == 0:
+            tl.device_print('after wait')
         tlx.fence_async_shared()
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
         tlx.async_descriptor_store_wait(0)
