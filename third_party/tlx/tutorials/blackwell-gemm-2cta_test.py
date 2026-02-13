@@ -29,7 +29,7 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
     pred_leader_cta = cluster_cta_rank % 2 == 0
 
     offs_am = pid_m * BLOCK_M
-    offs_bn = pid_n * BLOCK_N + (cluster_cta_rank % 2) * (BLOCK_N // 2)  # 2cta specific
+    offs_bn = pid_n * BLOCK_N + (cluster_cta_rank % 2) * (BLOCK_N // 2) +  (cluster_cta_rank // 2) * (BLOCK_N // 4) # 2cta specific
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -45,14 +45,14 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
         b_ptr,
         shape=[K, N],
         strides=[stride_bk, stride_bn],
-        block_shape=[BLOCK_K, BLOCK_N // 2],
+        block_shape=[BLOCK_K, (BLOCK_N // 2) // 2],
     )
 
     # async load a and b into SMEM
     buf_alloc_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, tl.constexpr(1))
-    buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float16, tl.constexpr(1))  # 2cta specific
+    buf_alloc_b = tlx.local_alloc((BLOCK_K, BLOCK_N // 4), tl.float16, tl.constexpr(2))  # 2cta specific
     a_smem = tlx.local_view(buf_alloc_a, 0)
-    b_smem = tlx.local_view(buf_alloc_b, 0)
+    # b_smem = tlx.local_view(buf_alloc_b, 0)
 
     bars = tlx.alloc_barriers(tl.constexpr(3))
     bar_a = tlx.local_view(bars, 0)
@@ -61,6 +61,8 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
     # 2cta specific
     bar_cta = tlx.alloc_barriers(1, arrive_count=2)  # CTA0 waits for CTA1's data before mma
     bar_leader_cta = tlx.local_view(bar_cta, 0)
+    smem_empty_bar_remote = tlx.alloc_barriers(1, arrive_count=2)
+    tma_bar_setup_bar_remote = tlx.alloc_barriers(1, arrive_count=2)
 
     buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
     acc_tmem = tlx.local_view(buffers, 0)
@@ -75,24 +77,45 @@ def tcgen5_dot_kernel2cta_tma(a_ptr, stride_am, stride_ak, b_ptr, stride_bk, str
     for k in range(0, num_iter):
         offs_k = k * BLOCK_K
 
+        tlx.barrier_wait(smem_empty_bar_remote, phase ^ 1)
+
         tlx.barrier_expect_bytes(bar_a, BLOCK_M * BLOCK_K * 2)
         tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2) * 2)  # 2cta specific
 
-        tlx.async_descriptor_load(desc_a, a_smem, [offs_am, offs_k], bar_a)
-        tlx.async_descriptor_load(desc_b, b_smem, [offs_k, offs_bn], bar_b)
+        # CTAs sync with each other before issuing TMA load, making sure bar is ready for TMA
+        # could use tlx.cluster_barrier() or below
+        tlx.barrier_arrive(tma_bar_setup_bar_remote, 1)
+        tlx.barrier_arrive(tma_bar_setup_bar_remote, 1, remote_cta_rank=cluster_cta_rank ^ 2)
+        tlx.barrier_wait(tma_bar_setup_bar_remote, phase)
 
+        tlx.async_descriptor_load(desc_a, a_smem, [offs_am, offs_k], bar_a)
+        # if tlx.thread_id(0) == 0:
+        #     tl.device_print('offs_bn=', offs_bn)
+        tlx.async_descriptor_load(desc_b, buf_alloc_b[cluster_cta_rank // 2], [offs_k, offs_bn], bar_b, multicast_targets=[cluster_cta_rank, cluster_cta_rank ^ 2])
+
+        # if tlx.thread_id(0) == 0:
+        #     tl.device_print('before wait')
         tlx.barrier_wait(bar_a, phase)
+        # if tlx.thread_id(0) == 0:
+        #     tl.device_print('after wait a')
         tlx.barrier_wait(bar_b, phase)
+        # if tlx.thread_id(0) == 0:
+        #     tl.device_print('after wait b')
 
         # CTA0 needs to know CTA1 is done loading data before issuing MMA
         tlx.barrier_arrive(bar_leader_cta, 1, remote_cta_rank=cluster_cta_rank & ~1)
         tlx.barrier_wait(bar_leader_cta, phase=k % 2, pred=pred_leader_cta)
+
+        b_smem = tlx.local_reinterpret(buf_alloc_b, tl.float16, [BLOCK_K, BLOCK_N // 2])
 
         # 2cta specific
         tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=True, mBarriers=[dot_bars[0]], two_ctas=True,
                       out_dtype=OUT_DTYPE)
 
         tlx.barrier_wait(dot_bars[0], phase)
+
+        tlx.barrier_arrive(smem_empty_bar_remote, 1)
+        tlx.barrier_arrive(smem_empty_bar_remote, 1, remote_cta_rank=cluster_cta_rank ^ 2)
         phase = phase ^ 1
 
     result = tlx.local_load(acc_tmem)
@@ -114,11 +137,11 @@ def matmul(a, b):
 
     triton.set_allocator(alloc_fn)
 
-    BLOCK_M, BLOCK_N, BLOCK_K = (128, 128, 128)
+    BLOCK_M, BLOCK_N, BLOCK_K = (128, 256, 128)
 
     kern_kwargs = {
         'BLOCK_M': BLOCK_M, 'BLOCK_K': BLOCK_K, 'BLOCK_N': BLOCK_N, 'OUT_DTYPE': tl.float32, 'M': M, 'N': N, 'K': K,
-        'num_stages': 0, 'ctas_per_cga': (4, 2, 1)
+        'num_stages': 0, 'ctas_per_cga': (4, 1, 1)
     }
     _ = tcgen5_dot_kernel2cta_tma[(M // BLOCK_M, N // BLOCK_N)](a, a.stride(0), a.stride(1), b, b.stride(0),
                                                                 b.stride(1), c, c.stride(0), c.stride(1), **kern_kwargs)
@@ -133,7 +156,7 @@ def matmul(a, b):
 def test_op():
     torch.manual_seed(0)
     for i in [8192]:
-        M, N, K = i, i, i
+        M, N, K = i,i,i
         a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
         b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
         torch_output = torch.matmul(a, b)
