@@ -40,6 +40,34 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
+LogicalResult verifyMMAOperand(gpu::MemDescType ty, bool isA) {
+  auto shape = ty.getShape();
+  if (shape.size() >= 2) {
+    if (auto mmaEncoding =
+            dyn_cast<NVMMASharedEncodingAttr>(ty.getEncoding())) {
+      if (mmaEncoding.getSwizzlingByteWidth() != 0) {
+        auto swizzlingDimSize = -1;
+        if (!mmaEncoding.getTransposed()) {
+          // K-major, so last dim of A and first dim of B are contiguous
+          swizzlingDimSize = isA ? shape[shape.size() - 1] : shape[0];
+        } else {
+          // MN-major, so first dim of A and last dim of B are contiguous
+          swizzlingDimSize = isA ? shape[0] : shape[shape.size() - 1];
+        }
+
+        // 8 * mmaEncoding.getSwizzlingByteWidth() is a basic unit (bits) of
+        // swizzling the swizzling/contig dim has to be a multiple of it
+        if ((swizzlingDimSize * mmaEncoding.getElementBitWidth()) %
+            (8 * mmaEncoding.getSwizzlingByteWidth() != 0)) {
+          return failure();
+        }
+      }
+    }
+  }
+
+  return success();
+}
+
 LogicalResult MapToRemoteBufferOp::verify() {
   // src and result should have the same type except MemorySpace
   MemDescType localType = getSrc().getType();
@@ -133,6 +161,15 @@ LogicalResult WarpGroupDotOp::verify() {
     if (aDotOpEnc.getKWidth() != kWidth) {
       return emitOpError("in-register LHS operand must have a kWidth of ")
              << kWidth << " but got " << aDotOpEnc.getKWidth();
+    }
+  }
+
+  if (failed(verifyMMAOperand(getB().getType(), false))) {
+    return emitOpError("Invalid operand B");
+  }
+  if (auto aType = dyn_cast<gpu::MemDescType>(getA().getType())) {
+    if (failed(verifyMMAOperand(aType, true))) {
+      return emitOpError("Invalid operand A");
     }
   }
 
@@ -426,6 +463,13 @@ LogicalResult TCGen5MMAOp::verify() {
   Type dtype = getD().getType().getElementType();
   if (failed(verifyMMADType(*this, atype, btype, dtype)))
     return failure();
+
+  if (failed(verifyMMAOperand(getB().getType(), false))) {
+    return emitOpError("Invalid operand B");
+  }
+  if (failed(verifyMMAOperand(getA().getType(), true))) {
+    return emitOpError("Invalid operand A");
+  }
   return success();
 }
 
@@ -526,7 +570,13 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   Type dtype = getD().getType().getElementType();
   if (failed(verifyMMADType(*this, atype, btype, dtype)))
     return failure();
-  return success();
+
+  if (failed(verifyMMAOperand(getB().getType(), false))) {
+    return emitOpError("Invalid operand B");
+  }
+  if (failed(verifyMMAOperand(getA().getType(), true))) {
+    return emitOpError("Invalid operand A");
+  }
   return success();
 }
 

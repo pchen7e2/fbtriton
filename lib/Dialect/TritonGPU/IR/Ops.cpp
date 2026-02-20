@@ -625,6 +625,36 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
   return success();
 }
 
+LogicalResult MemDescReinterpretOp::verify() {
+  auto oldType = getSrc().getType();
+  auto newType = getType();
+
+  if (oldType.getMemorySpace() != newType.getMemorySpace())
+    return emitError("source and destination memory space must match");
+
+  auto newShape = newType.getShape();
+  auto newEncoding = oldType.getEncoding();
+
+  if (!oldType.getShape().equals(newShape)) {
+    if (auto swizzledEncoding =
+            dyn_cast<SwizzledSharedEncodingAttr>(newEncoding)) {
+      auto swizzlingDim = swizzledEncoding.getOrder()[0];
+      if (newShape.size() <= swizzlingDim) {
+        return emitError("new shape incompatible with encoding");
+      }
+      // conservatively reject cases where swizzling might be interfered
+      // new shape swizzling dim must be a multiple of getVec(), the basic
+      // swizzling unit
+      if (newShape[swizzlingDim] % swizzledEncoding.getVec() != 0) {
+        return emitError(
+            "New shape causes insufficient elements for swizzling");
+      }
+    }
+  }
+
+  return success();
+}
+
 OpFoldResult MemDescReinterpretOp::fold(FoldAdaptor adaptor) {
   if (getType() == getSrc().getType())
     return getSrc();
