@@ -64,6 +64,7 @@ public:
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
     addIllegalOp<mlir::triton::tlx::PrintRegElementOp>();
+    addIllegalOp<mlir::triton::tlx::PrintSmemElementOp>();
 
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();

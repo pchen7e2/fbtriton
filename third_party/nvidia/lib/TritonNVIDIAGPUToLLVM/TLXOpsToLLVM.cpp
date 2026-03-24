@@ -6,6 +6,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 
 using namespace mlir;
@@ -130,10 +131,116 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
+// Lowers tlx.print_smem_element to a predicated SMEM load + vprintf call.
+//
+// At lowering time, we:
+//   1. Extract the smemObj (base ptr + per-dim subslice offsets) from the
+//      converted memdesc struct.
+//   2. Compute the static flat element offset by inverting the memdesc's
+//      LinearLayout and applying the compile-time logical indices.
+//   3. Add the dynamic subslice offset (from any local_view/local_slice ops).
+//   4. GEP to the element pointer and predicate on thread 0 (laneId==0 &&
+//      warpId==0).
+//   5. In the true branch, load the element from SMEM and call vprintf.
+struct PrintSmemElementOpConversion
+    : public ConvertOpToLLVMPattern<mlir::triton::tlx::PrintSmemElementOp> {
+  explicit PrintSmemElementOpConversion(LLVMTypeConverter &typeConverter,
+                                        const TargetInfoBase &targetInfo,
+                                        PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {
+  }
+
+  LogicalResult
+  matchAndRewrite(mlir::triton::tlx::PrintSmemElementOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+
+    auto memDescTy = cast<MemDescType>(op.getValue().getType());
+    auto llvmElemTy =
+        getTypeConverter()->convertType(memDescTy.getElementType());
+
+    // ── 1. Extract smemObj (base ptr + per-dim subslice offsets) ──
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getValue(), llvmElemTy, rewriter);
+
+    // ── 2. Compute static flat element index within this memdesc ──
+    // toLinearLayout maps {offset, block} → {dim0, dim1, ...}.
+    // sublayout on {offset} then invert: {dim0, dim1, ...} → {offset}.
+    int rank = memDescTy.getRank();
+    auto dimNames = triton::standardOutDimNames(ctx, rank);
+    auto kOffset = StringAttr::get(ctx, "offset");
+    LinearLayout ll;
+    if (auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(
+            memDescTy.getEncoding()))
+      ll = paddedEnc.getLinearComponent();
+    else
+      ll = triton::gpu::toLinearLayout(memDescTy);
+    ll = ll.sublayout({kOffset}, dimNames).invert();
+
+    ArrayRef<int64_t> indices = op.getIndices();
+    SmallVector<std::pair<StringAttr, int32_t>> logicalCoords;
+    for (int i = 0; i < rank; ++i)
+      logicalCoords.push_back({dimNames[i], (int32_t)indices[i]});
+    int32_t staticFlatOffset = ll.apply(logicalCoords)[0].second;
+
+    // ── 3. Add the dynamic subslice offset ──
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value dynamicOffset = smemObj.getShmemOffset(loc, rewriter, memDescTy);
+    Value totalOffset = b.add(dynamicOffset, b.i32_val(staticFlatOffset));
+
+    // ── 4. GEP to the element pointer ──
+    Value elemPtr = b.gep(smemObj.getBase().getType(), llvmElemTy,
+                          smemObj.getBase(), totalOffset);
+
+    // ── 5. Predicate: only thread 0 (laneId==0 && warpId==0) prints ──
+    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+    Value isLane0 = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::eq,
+                                                  laneId, b.i32_val(0));
+    Value isWarp0 = rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::eq,
+                                                  warpId, b.i32_val(0));
+    Value pred = rewriter.create<LLVM::AndOp>(loc, isLane0, isWarp0);
+
+    // ── 6. Build format string ──
+    auto module = op->getParentOfType<ModuleOp>();
+    std::array<Value, 3> pid;
+    for (auto axis : {ProgramIDDim::X, ProgramIDDim::Y, ProgramIDDim::Z})
+      pid[(int)axis] = targetInfo.programId(rewriter, loc, module, axis);
+
+    bool isSigned = op.getIsSigned();
+    std::string msg = "pid (%u, %u, %u)" + op.getPrefix().str() +
+                      getFormatSubstr(llvmElemTy, isSigned) + "\n";
+
+    // ── 7. Emit predicated load + printf via block splitting ──
+    auto *curBlock = rewriter.getInsertionBlock();
+    auto *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
+    auto *printBlock = rewriter.createBlock(
+        curBlock->getParent(), std::next(Region::iterator(curBlock)));
+
+    rewriter.setInsertionPointToEnd(curBlock);
+    rewriter.create<LLVM::CondBrOp>(loc, pred, printBlock, endBlock);
+
+    rewriter.setInsertionPointToEnd(printBlock);
+    Value elem = rewriter.create<LLVM::LoadOp>(loc, llvmElemTy, elemPtr);
+    SmallVector<Value> args = {pid[0], pid[1], pid[2], elem};
+    SmallVector<bool> argsSigned = {false, false, false, isSigned};
+    targetInfo.printf(rewriter, msg, args, argsSigned);
+    rewriter.create<LLVM::BrOp>(loc, endBlock);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
 } // namespace
 
 void mlir::triton::NVIDIA::populateTLXOpsToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     const TargetInfoBase &targetInfo, PatternBenefit benefit) {
   patterns.add<PrintRegElementOpConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<PrintSmemElementOpConversion>(typeConverter, targetInfo,
+                                             benefit);
 }

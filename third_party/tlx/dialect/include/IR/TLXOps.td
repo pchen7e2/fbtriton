@@ -306,6 +306,40 @@ def TLX_PrintRegElementOp : TLX_Op<"print_reg_element", []> {
   let assemblyFormat = "$value attr-dict `:` type($value)";
 }
 
+def TLX_PrintSmemElementOp : TLX_Op<"print_smem_element", []> {
+  let summary = "Print a single element from a shared-memory buffer addressed by logical index";
+
+  let description = [{
+    Prints a single element of a shared-memory buffer addressed by its logical
+    multi-dimensional index. The physical flat element offset is determined at
+    lowering time by inverting the buffer's LinearLayout — no hardcoding of the
+    hardware layout is required from the caller.
+
+    Thread 0 (laneId == 0 && warpId == 0) performs a single-element SMEM load
+    and issues the printf.
+
+    Arguments:
+    - `value`:     The shared-memory memdesc (after any local_view stripping).
+    - `indices`:   Compile-time logical indices into the buffer (one per dim).
+    - `prefix`:    Label prepended to the output line (may include "[i][j]:" etc.).
+    - `is_signed`: Whether the element type is a signed integer.
+
+    Output format (one line, from thread 0):
+      pid (<x>, <y>, <z>) <prefix><value>
+  }];
+
+  let arguments = (ins
+    TTG_MemDescType:$value,
+    DenseI64ArrayAttr:$indices,
+    StrAttr:$prefix,
+    BoolAttr:$is_signed
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
                                    [SameOperandAndResultMemorySpace,
                                     Pure]> {

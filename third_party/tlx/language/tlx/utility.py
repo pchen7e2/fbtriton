@@ -226,27 +226,14 @@ def print_element(tensor_or_buf, indices, prefix="", thread=0, _semantic=None):
             return
 
         # ── SMEM buffered_tensor ─────────────────────────────────────────────
-        assert thread == 0, (f"print_element on SMEM requires thread=0. "
-                             f"Got thread={thread}. The 1×1 local_load assigns the element to "
-                             f"thread 0 only (BlockedEncoding); other threads produce no output.")
+        from .mem_ops import local_view
 
-        from .mem_ops import local_load, local_slice, local_view
-
-        rank = len(indices)
-        shape_ones = [1] * rank
-
-        # local_alloc prepends the num count as a leading dim in the MLIR memdesc.
-        # local_view(buf, 0) strips it so local_slice sees the right rank.
         buf = tensor_or_buf
         if buf.type.num > 0:
             buf = local_view(buf, 0, _semantic=_semantic)
 
-        elem_memdesc = local_slice(buf, indices, shape_ones, _semantic=_semantic)
-        # Thread 0 owns [0,…,0] in the 1×1 BlockedEncoding; others own nothing
-        # → unpackLLElements returns empty → no vprintf for threads != 0.
-        elem_tensor = local_load(elem_memdesc, _semantic=_semantic)
-        is_signed = [elem_tensor.dtype.is_int_signed()]
-        _semantic.builder.create_print(full_prefix, False, [elem_tensor.handle], is_signed)
+        is_signed = [buf.dtype.is_int_signed()]
+        _semantic.builder.create_print_smem_element(buf.handle, indices, full_prefix, is_signed[0])
 
     else:
         raise TypeError(f"print_element expects a tl.tensor (register) or buffered_tensor (SMEM/TMEM), "
