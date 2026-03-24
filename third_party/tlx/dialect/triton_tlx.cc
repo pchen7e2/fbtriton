@@ -124,6 +124,15 @@ void init_triton_tlx_ir(py::module &&m) {
                  memdesc, DenseI64ArrayAttr::get(ctx, indices),
                  StringAttr::get(ctx, prefix), BoolAttr::get(ctx, is_signed));
            })
+      .def("create_print_tmem_element",
+           [](TritonOpBuilder &self, Value memdesc,
+              std::vector<int64_t> indices, std::string prefix,
+              bool is_signed) {
+             auto *ctx = self.getBuilder().getContext();
+             self.create<tlx::PrintTmemElementOp>(
+                 memdesc, DenseI64ArrayAttr::get(ctx, indices),
+                 StringAttr::get(ctx, prefix), BoolAttr::get(ctx, is_signed));
+           })
       .def("create_tmem_copy",
            [](TritonOpBuilder &self, Value src, Value dst) {
              self.create<ttng::TMEMCopyOp>(src, dst, /*barrier=*/Value());

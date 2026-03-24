@@ -340,6 +340,40 @@ def TLX_PrintSmemElementOp : TLX_Op<"print_smem_element", []> {
   let assemblyFormat = "$value attr-dict `:` type($value)";
 }
 
+def TLX_PrintTmemElementOp : TLX_Op<"print_tmem_element", []> {
+  let summary = "Print a single element from a tensor-memory buffer addressed by logical index";
+
+  let description = [{\
+    Prints a single element of a tensor-memory (TMEM) buffer addressed by its
+    logical multi-dimensional index. The physical TMEM coordinates (row, col)
+    are determined at lowering time by inverting the buffer's LinearLayout.
+
+    The issuing warp group (owningWarpInGroup = phys_row / 32) executes a
+    warp-collective tcgen05.ld to load the element; the owning lane
+    (owningLane = phys_row % 32) then issues the printf.
+
+    Arguments:
+    - `value`:     The tensor-memory memdesc (after any local_view stripping).
+    - `indices`:   Compile-time logical indices into the buffer (one per dim).
+    - `prefix`:    Label prepended to the output line.
+    - `is_signed`: Whether the element type is a signed integer.
+
+    Output format (one line, from the owning thread):
+      pid (<x>, <y>, <z>) <prefix><value>
+  }];
+
+  let arguments = (ins
+    TTG_MemDescType:$value,
+    DenseI64ArrayAttr:$indices,
+    StrAttr:$prefix,
+    BoolAttr:$is_signed
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
                                    [SameOperandAndResultMemorySpace,
                                     Pure]> {

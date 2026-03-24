@@ -1,4 +1,5 @@
 #include "PatternTritonGPUOpToLLVM.h"
+#include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "tlx/dialect/include/IR/Dialect.h"
@@ -235,6 +236,145 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
+// Lowers tlx.print_tmem_element to a warp-collective tcgen05.ld + predicated
+// vprintf call.
+//
+// At lowering time, we:
+//   1. Pseudoinvert the TMEM memdesc's LinearLayout to map the compile-time
+//      logical index → physical (row, col) hardware coordinates.
+//   2. Compute owningWarpInGroup = phys_row / 32 and owningLane = phys_row
+//   % 32.
+//   3. At runtime, predicate on (warpId & 3) == owningWarpInGroup so only
+//      the owning warp group executes the warp-collective tcgen05.ld.
+//   4. Inside that warp block, issue tcgen05.ld.sync.aligned.32x32b.x1.b32
+//      with colOffset = phys_col; thread owningLane receives the element.
+//   5. In a nested predicate on laneId == owningLane, call vprintf.
+struct PrintTmemElementOpConversion
+    : public ConvertOpToLLVMPattern<mlir::triton::tlx::PrintTmemElementOp> {
+  explicit PrintTmemElementOpConversion(LLVMTypeConverter &typeConverter,
+                                        const TargetInfoBase &targetInfo,
+                                        PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {
+  }
+
+  LogicalResult
+  matchAndRewrite(mlir::triton::tlx::PrintTmemElementOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+
+    auto memDescTy = cast<MemDescType>(op.getValue().getType());
+    auto llvmElemTy =
+        getTypeConverter()->convertType(memDescTy.getElementType());
+
+    // ── 1. Compute physical (row, col) via LinearLayout pseudoinverse ──
+    // tensorMemoryToLinearLayout maps {row, col} (physical) → {dim0, dim1}
+    // (logical). Inverting gives logical index → physical TMEM coordinates.
+    auto dimNames = triton::standardOutDimNames(ctx, 2);
+    LinearLayout ll = triton::gpu::toLinearLayout(memDescTy);
+    LinearLayout invLL = ll.pseudoinvert();
+
+    auto kRow = StringAttr::get(ctx, "row");
+    auto kCol = StringAttr::get(ctx, "col");
+
+    ArrayRef<int64_t> indices = op.getIndices();
+    SmallVector<std::pair<StringAttr, int32_t>> logicalCoords;
+    for (int i = 0; i < 2; ++i)
+      logicalCoords.push_back({dimNames[i], (int32_t)indices[i]});
+
+    auto hwCoords = invLL.apply(logicalCoords);
+    int32_t physRow = 0, physCol = 0;
+    for (auto [name, val] : hwCoords) {
+      if (name == kRow)
+        physRow = val;
+      else if (name == kCol)
+        physCol = val;
+    }
+
+    int32_t owningWarpInGroup = physRow / 32;
+    int32_t owningLane = physRow % 32;
+
+    // ── 2. Get the TMEM base address as i32 ──
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value tmemBasePtr = adaptor.getValue();
+    Value tmemBaseInt = b.ptrtoint(rewriter.getI32Type(), tmemBasePtr);
+    // Add the owning warp group's row offset: owningWarpInGroup * 32 << 16.
+    Value tmemAddr =
+        b.add(tmemBaseInt, b.i32_val(owningWarpInGroup << (5 + 16)));
+
+    // ── 3. Build runtime predicates ──
+    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+    Value warpIdInGroup = b.and_(warpId, b.i32_val(3));
+    Value isOwningWarpGroup = rewriter.create<LLVM::ICmpOp>(
+        loc, LLVM::ICmpPredicate::eq, warpIdInGroup,
+        b.i32_val(owningWarpInGroup));
+    Value isOwningLane = rewriter.create<LLVM::ICmpOp>(
+        loc, LLVM::ICmpPredicate::eq, laneId, b.i32_val(owningLane));
+
+    // ── 4. Build format string + pid ──
+    auto module = op->getParentOfType<ModuleOp>();
+    std::array<Value, 3> pid;
+    for (auto axis : {ProgramIDDim::X, ProgramIDDim::Y, ProgramIDDim::Z})
+      pid[(int)axis] = targetInfo.programId(rewriter, loc, module, axis);
+
+    bool isSigned = op.getIsSigned();
+    // For 32-bit element types bitcast the raw i32; otherwise print raw bits.
+    Type elemTyForFormat =
+        (llvmElemTy.isInteger(32) || llvmElemTy.isF32()) ? llvmElemTy : i32_ty;
+    std::string msg = "pid (%u, %u, %u)" + op.getPrefix().str() +
+                      getFormatSubstr(elemTyForFormat, isSigned) + "\n";
+
+    // ── 5. Emit block structure ──
+    // curBlock → (warpGroup pred) → ldBlock (or endBlock)
+    // ldBlock  → tcgen05.ld → (lane pred) → printBlock (or endBlock)
+    // printBlock → printf → endBlock
+    auto *curBlock = rewriter.getInsertionBlock();
+    auto *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
+    auto *ldBlock = rewriter.createBlock(curBlock->getParent(),
+                                         std::next(Region::iterator(curBlock)));
+    auto *printBlock = rewriter.createBlock(
+        ldBlock->getParent(), std::next(Region::iterator(ldBlock)));
+
+    // curBlock: branch on warp group.
+    rewriter.setInsertionPointToEnd(curBlock);
+    rewriter.create<LLVM::CondBrOp>(loc, isOwningWarpGroup, ldBlock, endBlock);
+
+    // ldBlock: issue warp-collective tcgen05.ld, then branch on lane.
+    rewriter.setInsertionPointToEnd(ldBlock);
+    PTXBuilder ptxBuilder;
+    std::string ldOpcode =
+        "tcgen05.ld.sync.aligned.32x32b.x1.b32 {$0}, [$1 + " +
+        std::to_string(physCol) + "];";
+    auto *resultOp = ptxBuilder.newOperand("=r");
+    auto *addrOp = ptxBuilder.newOperand(tmemAddr, "r");
+    auto &ldInstr = *ptxBuilder.create<PTXInstr>(ldOpcode);
+    ldInstr({resultOp, addrOp}, /*onlyAttachMLIRArgs=*/true);
+    Value rawI32 = ptxBuilder.launch(rewriter, loc, i32_ty);
+
+    // Cast raw i32 to the element type for formatting.
+    Value elem;
+    if (llvmElemTy.isInteger(32) || llvmElemTy.isF32())
+      elem = b.bitcast(rawI32, llvmElemTy);
+    else
+      elem = rawI32; // sub-32-bit types: print raw i32 bits
+
+    rewriter.create<LLVM::CondBrOp>(loc, isOwningLane, printBlock, endBlock);
+
+    // printBlock: printf and jump to endBlock.
+    rewriter.setInsertionPointToEnd(printBlock);
+    SmallVector<Value> args = {pid[0], pid[1], pid[2], elem};
+    SmallVector<bool> argsSigned = {false, false, false, isSigned};
+    targetInfo.printf(rewriter, msg, args, argsSigned);
+    rewriter.create<LLVM::BrOp>(loc, endBlock);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
 } // namespace
 
 void mlir::triton::NVIDIA::populateTLXOpsToLLVMPatterns(
@@ -242,5 +382,7 @@ void mlir::triton::NVIDIA::populateTLXOpsToLLVMPatterns(
     const TargetInfoBase &targetInfo, PatternBenefit benefit) {
   patterns.add<PrintRegElementOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<PrintSmemElementOpConversion>(typeConverter, targetInfo,
+                                             benefit);
+  patterns.add<PrintTmemElementOpConversion>(typeConverter, targetInfo,
                                              benefit);
 }

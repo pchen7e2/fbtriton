@@ -197,43 +197,28 @@ def print_element(tensor_or_buf, indices, prefix="", thread=0, _semantic=None):
         _semantic.builder.create_print_reg_element(tensor_or_buf.handle, indices, full_prefix, is_signed)
 
     elif isinstance(tensor_or_buf, _buffered_tensor):
-        if tensor_or_buf.type.storage == _storage_kind.tmem:
-            # ── TMEM buffered_tensor ─────────────────────────────────────────
-            # TMEM loads (tcgen05.ld) are warp-collective: all threads in the
-            # warp must participate.  We therefore:
-            #   1. Load the single column j unconditionally (warp-collective).
-            #   2. Gate tt.print on tid == row so only thread `row` prints.
-            #      Thread `row` owns element [row, 0] of the loaded [M,1] tensor.
-            # The `thread` argument is intentionally ignored for TMEM — the
-            # issuing thread is always determined by the row index.
-            assert len(indices) == 2, (f"TMEM tensors are rank-2 [M, N]; got {len(indices)} indices.")
-            row, col = indices[0], indices[1]
-            M = tensor_or_buf.shape[0]
-
-            from .mem_ops import local_load, local_slice, local_view
-
-            buf = tensor_or_buf
-            if buf.type.num > 0:
-                buf = local_view(buf, 0, _semantic=_semantic)
-
-            # Slice the single column containing the element.
-            col_slice = local_slice(buf, [0, col], [M, 1], _semantic=_semantic)
-            # Warp-collective load — ALL threads must execute this.
-            col_tensor = local_load(col_slice, _semantic=_semantic)
-            # Only thread `row` prints; it owns tmem_buf[row, col] = col_tensor[row, 0].
-            is_signed = [col_tensor.dtype.is_int_signed()]
-            _print_element_emit_predicated(col_tensor.handle, is_signed, full_prefix, row, _semantic)
-            return
-
-        # ── SMEM buffered_tensor ─────────────────────────────────────────────
         from .mem_ops import local_view
 
         buf = tensor_or_buf
         if buf.type.num > 0:
             buf = local_view(buf, 0, _semantic=_semantic)
 
-        is_signed = [buf.dtype.is_int_signed()]
-        _semantic.builder.create_print_smem_element(buf.handle, indices, full_prefix, is_signed[0])
+        if tensor_or_buf.type.storage == _storage_kind.tmem:
+            # ── TMEM buffered_tensor ─────────────────────────────────────────
+            # Use TLX_PrintTmemElementOp: at lowering time it inverts the TMEM
+            # LinearLayout to find the physical (row, col), predicates a
+            # warp-collective tcgen05.ld on the owning warp group, and
+            # predicates the printf on the owning lane (phys_row % 32).
+            # The `thread` argument is ignored; the issuing thread is determined
+            # by the row index via the LinearLayout pseudoinverse.
+            assert len(indices) == 2, (f"TMEM tensors are rank-2 [M, N]; got {len(indices)} indices.")
+            is_signed = buf.dtype.is_int_signed()
+            _semantic.builder.create_print_tmem_element(buf.handle, indices, full_prefix, is_signed)
+            return
+
+        # ── SMEM buffered_tensor ─────────────────────────────────────────────
+        is_signed = buf.dtype.is_int_signed()
+        _semantic.builder.create_print_smem_element(buf.handle, indices, full_prefix, is_signed)
 
     else:
         raise TypeError(f"print_element expects a tl.tensor (register) or buffered_tensor (SMEM/TMEM), "
