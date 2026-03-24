@@ -271,6 +271,41 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 }
 
+//===----------------------------------------------------------------------===//
+// Print Register Element Operation
+//===----------------------------------------------------------------------===//
+
+def TLX_PrintRegElementOp : TLX_Op<"print_reg_element", []> {
+  let summary = "Print one element of a distributed register tensor by logical index";
+
+  let description = [{
+    Prints a single element of a distributed register tensor addressed by its
+    logical multi-dimensional index. The owning thread is determined at lowering
+    time by pseudoinverting the tensor's LinearLayout — no knowledge of the
+    hardware layout is required from the caller.
+
+    Arguments:
+    - `value`:     The distributed register tensor.
+    - `indices`:   Compile-time logical indices into the tensor (one per dim).
+    - `prefix`:    Label prepended to the output line (may include "[i][j]:" etc.).
+    - `is_signed`: Whether the element type is a signed integer.
+
+    Output format (one line, from the single owning thread):
+      pid (<x>, <y>, <z>) <prefix><value>
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$value,
+    DenseI64ArrayAttr:$indices,
+    StrAttr:$prefix,
+    BoolAttr:$is_signed
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
                                    [SameOperandAndResultMemorySpace,
                                     Pure]> {

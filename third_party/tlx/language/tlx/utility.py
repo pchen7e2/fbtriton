@@ -134,6 +134,125 @@ def clock64(_semantic=None):
     return tl.tensor(_semantic.builder.create_clock64(), tl.int64)
 
 
+def _print_element_emit_predicated(value_handle, is_signed, full_prefix, thread, _semantic):
+    """Gate tt.print on tid == thread using scf.if."""
+    b = _semantic.builder
+    tid = b.create_thread_id(0)
+    cond = b.create_icmpEQ(tid, b.get_int32(thread))
+    if_op = b.create_if_op([], cond, False)
+    ip = b.get_insertion_point()
+    # create_if_op auto-inserts a scf.yield terminator; insert our ops at
+    # the start of the block so they land before the auto-yield.
+    b.set_insertion_point_to_start(if_op.get_then_block())
+    b.create_print(full_prefix, False, [value_handle], is_signed)
+    b.restore_insertion_point(ip)
+
+
+@tl.builtin
+def print_element(tensor_or_buf, indices, prefix="", thread=0, _semantic=None):
+    """
+    Print a single element of a tensor by logical coordinate, regardless of where
+    the tensor lives (register, SMEM, or TMEM).
+
+    Args:
+        tensor_or_buf: A register tensor (tl.tensor) or buffered_tensor (SMEM/TMEM).
+        indices:  List of compile-time integer indices, one per dimension.
+        prefix:   Optional string label prepended to the output.
+        thread:   Flat CTA thread ID (tid.x) that issues the print.
+                  - Register: ignored; the owning thread is computed automatically
+                    from the tensor's LinearLayout via pseudoinverse.
+                  - SMEM: must be 0 (the 1×1 local_load only exposes the value to
+                    thread 0 via BlockedEncoding).
+                  - TMEM: not allowed; raises a compile-time error.
+
+    Output format::
+
+        pid (x, y, z) <prefix>[i][j]: <value>   (register)
+        pid (x, y, z) idx (...) <prefix>[i][j]: <value>  (SMEM/TMEM)
+
+    Examples::
+
+        # Register tensor — owning thread computed automatically from layout
+        tlx.print_element(vals, [123456], prefix="val")
+
+        # SMEM buffered_tensor
+        tlx.print_element(smem_a, [row, col], prefix="A")
+    """
+    from .types import buffered_tensor as _buffered_tensor, storage_kind as _storage_kind
+
+    indices = [tl._unwrap_if_constexpr(i) for i in indices]
+    thread = tl._unwrap_if_constexpr(thread)
+    prefix = tl._unwrap_if_constexpr(prefix)
+
+    idx_str = "".join(f"[{i}]" for i in indices)
+    full_prefix = f" {prefix}{idx_str}: " if prefix else f" {idx_str}: "
+
+    if isinstance(tensor_or_buf, tl.tensor):
+        # ── Register tensor ──────────────────────────────────────────────────
+        # Emit tlx.print_reg_element, which is lowered in the NVIDIA TTGIR→LLVM
+        # conversion pass.  The lowering pseudoinverts the tensor's LinearLayout
+        # to find which (register, lane, warp) owns the requested logical index,
+        # then emits a predicated vprintf from only that thread.
+        is_signed = tensor_or_buf.dtype.is_int_signed()
+        _semantic.builder.create_print_reg_element(tensor_or_buf.handle, indices, full_prefix, is_signed)
+
+    elif isinstance(tensor_or_buf, _buffered_tensor):
+        if tensor_or_buf.type.storage == _storage_kind.tmem:
+            # ── TMEM buffered_tensor ─────────────────────────────────────────
+            # TMEM loads (tcgen05.ld) are warp-collective: all threads in the
+            # warp must participate.  We therefore:
+            #   1. Load the single column j unconditionally (warp-collective).
+            #   2. Gate tt.print on tid == row so only thread `row` prints.
+            #      Thread `row` owns element [row, 0] of the loaded [M,1] tensor.
+            # The `thread` argument is intentionally ignored for TMEM — the
+            # issuing thread is always determined by the row index.
+            assert len(indices) == 2, (f"TMEM tensors are rank-2 [M, N]; got {len(indices)} indices.")
+            row, col = indices[0], indices[1]
+            M = tensor_or_buf.shape[0]
+
+            from .mem_ops import local_load, local_slice, local_view
+
+            buf = tensor_or_buf
+            if buf.type.num > 0:
+                buf = local_view(buf, 0, _semantic=_semantic)
+
+            # Slice the single column containing the element.
+            col_slice = local_slice(buf, [0, col], [M, 1], _semantic=_semantic)
+            # Warp-collective load — ALL threads must execute this.
+            col_tensor = local_load(col_slice, _semantic=_semantic)
+            # Only thread `row` prints; it owns tmem_buf[row, col] = col_tensor[row, 0].
+            is_signed = [col_tensor.dtype.is_int_signed()]
+            _print_element_emit_predicated(col_tensor.handle, is_signed, full_prefix, row, _semantic)
+            return
+
+        # ── SMEM buffered_tensor ─────────────────────────────────────────────
+        assert thread == 0, (f"print_element on SMEM requires thread=0. "
+                             f"Got thread={thread}. The 1×1 local_load assigns the element to "
+                             f"thread 0 only (BlockedEncoding); other threads produce no output.")
+
+        from .mem_ops import local_load, local_slice, local_view
+
+        rank = len(indices)
+        shape_ones = [1] * rank
+
+        # local_alloc prepends the num count as a leading dim in the MLIR memdesc.
+        # local_view(buf, 0) strips it so local_slice sees the right rank.
+        buf = tensor_or_buf
+        if buf.type.num > 0:
+            buf = local_view(buf, 0, _semantic=_semantic)
+
+        elem_memdesc = local_slice(buf, indices, shape_ones, _semantic=_semantic)
+        # Thread 0 owns [0,…,0] in the 1×1 BlockedEncoding; others own nothing
+        # → unpackLLElements returns empty → no vprintf for threads != 0.
+        elem_tensor = local_load(elem_memdesc, _semantic=_semantic)
+        is_signed = [elem_tensor.dtype.is_int_signed()]
+        _semantic.builder.create_print(full_prefix, False, [elem_tensor.handle], is_signed)
+
+    else:
+        raise TypeError(f"print_element expects a tl.tensor (register) or buffered_tensor (SMEM/TMEM), "
+                        f"got {type(tensor_or_buf).__name__}.")
+
+
 @tl.builtin
 def stoch_round(
     src: tl.tensor,

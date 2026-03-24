@@ -663,6 +663,8 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
   patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
                                                            context);
+  patterns.add<GenericOpPattern<triton::tlx::PrintRegElementOp>>(typeConverter,
+                                                             context);
 }
 
 //

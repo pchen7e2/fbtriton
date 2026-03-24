@@ -63,6 +63,7 @@ public:
     addIllegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+    addIllegalOp<mlir::triton::tlx::PrintRegElementOp>();
 
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
@@ -148,6 +149,8 @@ struct ConvertTritonGPUToLLVM
                                                     targetInfo, benefit);
     mlir::triton::populatePrintOpToLLVMPattern(typeConverter, patterns,
                                                targetInfo, benefit);
+    mlir::triton::NVIDIA::populateTLXOpsToLLVMPatterns(typeConverter, patterns,
+                                                       targetInfo, benefit);
     mlir::triton::populateControlFlowOpToLLVMPattern(typeConverter, patterns,
                                                      targetInfo, benefit);
     mlir::triton::NVIDIA::populateSPMDOpToLLVMPattern(typeConverter, patterns,

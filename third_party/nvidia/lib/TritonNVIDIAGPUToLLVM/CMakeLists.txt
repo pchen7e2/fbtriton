@@ -10,6 +10,7 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     LoadStoreOpToLLVM.cpp
     BarrierOpToLLVM.cpp
     TritonGPUToLLVM.cpp
+    TLXOpsToLLVM.cpp
     TMAToLLVM.cpp
     SPMDOpToLLVM.cpp
     TensorMemoryToLLVM.cpp

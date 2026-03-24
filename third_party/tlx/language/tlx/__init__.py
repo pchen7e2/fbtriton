@@ -78,6 +78,7 @@ from .utility import (
     cluster_size_1d,
     dtype_of,
     get_fp8_format_name,
+    print_element,
     size_of,
     stoch_round,
     thread_id,
@@ -161,6 +162,7 @@ __all__ = [
     "size_of",
     "clock64",
     "stoch_round",
+    "print_element",
     # dynamic launcher ops
     "_alloc_clc_responses",
     "_clc_issue",
