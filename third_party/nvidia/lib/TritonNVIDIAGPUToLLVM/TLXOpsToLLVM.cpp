@@ -54,9 +54,10 @@ struct PrintRegElementOpConversion
 
     ArrayRef<int64_t> indices = op.getIndices();
     SmallVector<std::pair<StringAttr, int32_t>> logicalCoords;
+    auto outDimNames = standardOutDimNames(ctx, indices.size());
     for (int i = 0; i < (int)indices.size(); ++i)
-      logicalCoords.push_back({StringAttr::get(ctx, "dim" + std::to_string(i)),
-                               static_cast<int32_t>(indices[i])});
+      logicalCoords.push_back(
+          {outDimNames[i], static_cast<int32_t>(indices[i])});
 
     auto hwCoords = invLL.apply(logicalCoords);
 
@@ -236,7 +237,7 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
-// Lowers tlx.print_tmem_element to a warp-collective tcgen05.ld + predicated
+// Lowers tlx.print_tmem_element to a predicated tcgen05.ld + predicated
 // vprintf call.
 //
 // At lowering time, we:
@@ -244,11 +245,12 @@ private:
 //      logical index → physical (row, col) hardware coordinates.
 //   2. Compute owningWarpInGroup = phys_row / 32 and owningLane = phys_row
 //   % 32.
-//   3. At runtime, predicate on (warpId & 3) == owningWarpInGroup so only
-//      the owning warp group executes the warp-collective tcgen05.ld.
-//   4. Inside that warp block, issue tcgen05.ld.sync.aligned.32x32b.x1.b32
-//      with colOffset = phys_col; thread owningLane receives the element.
-//   5. In a nested predicate on laneId == owningLane, call vprintf.
+//   3. Emit "@$pred tcgen05.ld.sync.aligned.32x32b.x1.b32" in the main code
+//      path so ALL warps execute the asm but non-owning warps get a NOP.
+//      This avoids a divergent branch before a warp-collective instruction,
+//      which can deadlock when preceded by other divergent print ops.
+//   4. Predicate vprintf on (warpId & 3) == owningWarpInGroup && laneId ==
+//      owningLane (a single block split for printf only).
 struct PrintTmemElementOpConversion
     : public ConvertOpToLLVMPattern<mlir::triton::tlx::PrintTmemElementOp> {
   explicit PrintTmemElementOpConversion(LLVMTypeConverter &typeConverter,
@@ -324,31 +326,33 @@ struct PrintTmemElementOpConversion
     std::string msg = "pid (%u, %u, %u)" + op.getPrefix().str() +
                       getFormatSubstr(elemTyForFormat, isSigned) + "\n";
 
-    // ── 5. Emit block structure ──
-    // curBlock → (warpGroup pred) → ldBlock (or endBlock)
-    // ldBlock  → tcgen05.ld → (lane pred) → printBlock (or endBlock)
-    // printBlock → printf → endBlock
-    auto *curBlock = rewriter.getInsertionBlock();
-    auto *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
-    auto *ldBlock = rewriter.createBlock(curBlock->getParent(),
-                                         std::next(Region::iterator(curBlock)));
-    auto *printBlock = rewriter.createBlock(
-        ldBlock->getParent(), std::next(Region::iterator(ldBlock)));
+    // ── 5. Emit predicated tcgen05.ld then predicated printf ──
+    //
+    // The original two-level block split (branch to ldBlock for owning warp,
+    // then branch to printBlock for owning lane) causes the GPU to hang when
+    // preceded by other print operations with divergent branches. The root
+    // cause is that a divergent CondBrOp before tcgen05.ld.sync can prevent
+    // all 32 threads of the owning warp from reaching the instruction together.
+    //
+    // Fix: emit @$pred tcgen05.ld.sync in the main code path so ALL warps
+    // see the same PTX asm but warps where isOwningWarpGroup==false get a NOP.
+    // Then use a single block split only for vprintf, guarded by the combined
+    // isOwningWarpGroup && isOwningLane predicate.
+    //
+    // Block structure (after fix):
+    //   curBlock → @pred tcgen05.ld → (owning thread) → printBlock → endBlock
+    //   printBlock → printf → endBlock
 
-    // curBlock: branch on warp group.
-    rewriter.setInsertionPointToEnd(curBlock);
-    rewriter.create<LLVM::CondBrOp>(loc, isOwningWarpGroup, ldBlock, endBlock);
-
-    // ldBlock: issue warp-collective tcgen05.ld, then branch on lane.
-    rewriter.setInsertionPointToEnd(ldBlock);
+    // Issue @pred tcgen05.ld in the main code path (no block split here).
     PTXBuilder ptxBuilder;
     std::string ldOpcode =
-        "tcgen05.ld.sync.aligned.32x32b.x1.b32 {$0}, [$1 + " +
+        "@$2 tcgen05.ld.sync.aligned.32x32b.x1.b32 {$0}, [$1 + " +
         std::to_string(physCol) + "];";
     auto *resultOp = ptxBuilder.newOperand("=r");
     auto *addrOp = ptxBuilder.newOperand(tmemAddr, "r");
+    auto *predOp = ptxBuilder.newOperand(isOwningWarpGroup, "b");
     auto &ldInstr = *ptxBuilder.create<PTXInstr>(ldOpcode);
-    ldInstr({resultOp, addrOp}, /*onlyAttachMLIRArgs=*/true);
+    ldInstr({resultOp, addrOp, predOp}, /*onlyAttachMLIRArgs=*/true);
     Value rawI32 = ptxBuilder.launch(rewriter, loc, i32_ty);
 
     // Cast raw i32 to the element type for formatting.
@@ -358,7 +362,17 @@ struct PrintTmemElementOpConversion
     else
       elem = rawI32; // sub-32-bit types: print raw i32 bits
 
-    rewriter.create<LLVM::CondBrOp>(loc, isOwningLane, printBlock, endBlock);
+    // Single block split: only the owning thread (owning warp + owning lane)
+    // enters printBlock.
+    Value isOwningThread =
+        rewriter.create<LLVM::AndOp>(loc, isOwningWarpGroup, isOwningLane);
+    auto *curBlock = rewriter.getInsertionBlock();
+    auto *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
+    auto *printBlock = rewriter.createBlock(
+        curBlock->getParent(), std::next(Region::iterator(curBlock)));
+
+    rewriter.setInsertionPointToEnd(curBlock);
+    rewriter.create<LLVM::CondBrOp>(loc, isOwningThread, printBlock, endBlock);
 
     // printBlock: printf and jump to endBlock.
     rewriter.setInsertionPointToEnd(printBlock);
