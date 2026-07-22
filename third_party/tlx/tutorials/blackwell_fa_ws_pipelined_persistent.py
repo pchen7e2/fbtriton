@@ -2435,7 +2435,7 @@ def _attn_bwd_ws(
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
 
-    with tlx.async_tasks():
+    with tlx.async_tasks(exclusive=True):
         # compute
         with tlx.async_task("default"):
             blk_idx = 0
@@ -2589,7 +2589,7 @@ def _attn_bwd_ws(
             kv_buf_id, kv_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
 
             tlx.barrier_wait(dv_fulls[kv_buf_id], kv_phase)
-            DKV_STORE_ITERS: tl.constexpr = HEAD_DIM // DKV_STORE_NCOL
+            DKV_STORE_ITERS: tl.constexpr = HEAD_DIM // DKV_STORE_NCOL  # 128 // 64 = 2
             for slice_id in tl.static_range(DKV_STORE_ITERS):
                 dv_slice = tlx.local_slice(
                     dv_tiles[kv_buf_id],
