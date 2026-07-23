@@ -2003,6 +2003,12 @@ def _bwd_compute_inner_loop(
     QK_READ_DONE_BAR: tl.constexpr = 10
     DP_READ_DONE_BAR: tl.constexpr = 11
     NUM_COMPUTE_THREADS: tl.constexpr = 8 * 32
+    # Column (query-axis) sub-tile width for the register-pressure split. Instead
+    # of loading the full [BLOCK_N1, BLOCK_M1] qkT/dpT tiles at once, the compute
+    # loop reads NUM_COMPUTE_SLICES separate [BLOCK_N1, SUB_M] slices from TMEM
+    # and runs the whole P + dS pipeline per slice, so a full-width tile is never
+    # register-resident.
+    SUB_M: tl.constexpr = BLOCK_M1 // NUM_COMPUTE_SLICES
     if num_steps_override > 0:
         num_steps = num_steps_override
     else:
@@ -2013,36 +2019,55 @@ def _bwd_compute_inner_loop(
         ds_buf_id, _ = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
         # Wait for QK first (from MMA, typically ready sooner), then M.
-        # D wait is deferred to right before dS computation (like FA4).
         m_buf_id, m_phase = get_bufidx_phase(blk_idx, M_STAGE)
         d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
         tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
 
-        qkT = tlx.local_load(qk_tiles[tmem_buf_id])
-        m = tlx.local_load(sM_tiles[m_buf_id])
-        # qkT/pT are transposed: [BLOCK_N1 (keys), BLOCK_M1 (queries)]. Apply the
-        # causal mask to the logits via the R2P bitmask helper (keep query-cols
-        # m >= key-row n), then exp2 (exp2(-inf) = 0), avoiding the per-element
-        # ISETP arithmetic of `offs_m >= offs_n`.
-        sT = _sub_f32x2(qkT, m[None, :])
-        if STAGE == 1:
-            col_limit_left = (offs_n - curr_m)[:, None]
-            sT = _apply_causal_mask(sT, col_limit_left, BLOCK_M1, keep_ge=True)
-        pT = tl.math.exp2(sT)
+        # Register-pressure split: walk BLOCK_M1 (qkT's query/column axis) in
+        # NUM_COMPUTE_SLICES column sub-tiles. Each iteration loads only a
+        # [BLOCK_N1, SUB_M] slice of qkT/dpT from TMEM and runs the whole P + dS
+        # pipeline on it, so a full-width qkT/pT/dpT/dsT register tile is never
+        # live -- the peak footprint is ~1/NUM_COMPUTE_SLICES of loading the tile
+        # whole.
+        # qkT0 = tlx.local_load(tlx.subslice(qk_tiles[tmem_buf_id], 0 * SUB_M, SUB_M))
+        # qkT1 = tlx.local_load(tlx.subslice(qk_tiles[tmem_buf_id], 1 * SUB_M, SUB_M))
+        m0 = tlx.local_load(tlx.local_slice(sM_tiles[m_buf_id], [0 * SUB_M], [SUB_M]))
+        m1 = tlx.local_load(tlx.local_slice(sM_tiles[m_buf_id], [1 * SUB_M], [SUB_M]))
+        for i in tl.static_range(NUM_COMPUTE_SLICES):
+            # --- Phase 1/2: pT = exp2(qkT - m) for column slice i. ---
+            qkT = tlx.local_load(tlx.subslice(qk_tiles[tmem_buf_id], i * SUB_M, SUB_M))
+            # if i==0:
+            #     qkT = qkT0
+            # else:
+            #     qkT = qkT1
+            # m = tlx.local_load(tlx.local_slice(sM_tiles[m_buf_id], [i * SUB_M], [SUB_M]))
+            if i == 0:
+                m = m0
+            else:
+                m = m1
+            # qkT/pT are transposed: [BLOCK_N1 (keys), SUB_M (queries)]. Apply the
+            # causal mask via the R2P bitmask helper (keep query-cols m >= key-row
+            # n), then exp2 (exp2(-inf) = 0). The per-key left bound is shifted by
+            # the slice's column base so the helper's local arange(0, SUB_M) maps
+            # to global queries [i*SUB_M, (i+1)*SUB_M).
+            sT = _sub_f32x2(qkT, m[None, :])
+            if STAGE == 1:
+                col_limit_left = (offs_n - curr_m - i * SUB_M)[:, None]
+                sT = _apply_causal_mask(sT, col_limit_left, SUB_M, keep_ge=True)
+            pT = tl.math.exp2(sT)
+            # Hazard 1 (intra-task WAR): P (f16) aliases the qk (f32) TMEM region;
+            # tcgen05 ld/st warp->chunk maps differ, so a fast warp's P store can
+            # overwrite a chunk a slow warp has not read as qkT. Rendezvous all 8
+            # warps between this slice's read and store. The P sub-tiles occupy
+            # the lower TMEM columns and never overlap a not-yet-read qkT slice
+            # (upper columns), so there is no cross-slice race.
 
-        # Store P to TMEM.
-        ppT = pT.to(do_out_dtype)
-        # Hazard 1 (intra-task WAR): P (f16) aliases the upper half of the qk
-        # (f32) TMEM region; tcgen05 ld/st warp->chunk maps differ, so a fast
-        # warp's P store can overwrite a 32x32 chunk a slow warp has not read as
-        # qkT. Rendezvous all 8 compute warps between the read and the store.
-        tlx.named_barrier_wait(QK_READ_DONE_BAR, NUM_COMPUTE_THREADS)
-        tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
-        # P aliases the QK TMEM region, so qk_empties (which frees that region for
-        # reuse) must be signaled after P is stored, not before. The
-        # local_store->TMEM lowering auto-emits tcgen05.wait::st, so p_fulls
-        # already observes the completed P store; no manual wait.
+            # Store P to TMEM.
+            ppT = pT.to(do_out_dtype)
+            if i == 0:
+                tlx.named_barrier_wait(QK_READ_DONE_BAR, NUM_COMPUTE_THREADS)
+            tlx.local_store(tlx.subslice(p_tiles[tmem_buf_id + P_BUF_OFFSET], i * SUB_M, SUB_M), ppT)
         if USE_2CTA:
             tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
             tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
@@ -2050,24 +2075,47 @@ def _bwd_compute_inner_loop(
             tlx.barrier_arrive(qk_empties[tmem_buf_id])
             tlx.barrier_arrive(p_fulls[tmem_buf_id])
 
-        # --- Phase 3: Compute dS = pT * (dpT - Di). ---
+        # dp/d fulls are waited once up front (vs. the original "defer D to right
+        # before dS") because dpT/Di are now read per column slice below.
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
-        dpT = tlx.local_load(dp_tiles[tmem_buf_id])
-        tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
-        Di = tlx.local_load(sD_tiles[d_buf_id])
-        tlx.barrier_arrive(m_empties[m_buf_id])
-        tlx.barrier_arrive(d_empties[d_buf_id])
-        dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
-        dsT = dsT.to(q_out_dtype)
-        # Hazard 1 (intra-task WAR): dsT (f16) aliases dp's (f32) region -- same
-        # warp->chunk mismatch as the P store above.
-        tlx.named_barrier_wait(DP_READ_DONE_BAR, NUM_COMPUTE_THREADS)
-        tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
+        for i in tl.static_range(NUM_COMPUTE_SLICES):
+            # --- Phase 3: dS = pT * (dpT - Di) for column slice i. ---
+            dpT = tlx.local_load(tlx.subslice(dp_tiles[tmem_buf_id], i * SUB_M, SUB_M))
+            if i == 0:
+                tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
+
+            Di = tlx.local_load(tlx.local_slice(sD_tiles[d_buf_id], [i * SUB_M], [SUB_M]))
+            if i == 1:
+                tlx.barrier_arrive(m_empties[m_buf_id])
+                tlx.barrier_arrive(d_empties[d_buf_id])
+            dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
+            dsT = dsT.to(q_out_dtype)
+            # Hazard 1 (intra-task WAR): dsT (f16) aliases dp's (f32) region --
+            # same warp->chunk mismatch as the P store above (dsT also lives in
+            # the lower dp columns, disjoint from a not-yet-read dpT slice).
+            if i == 0:
+                tlx.named_barrier_wait(DP_READ_DONE_BAR, NUM_COMPUTE_THREADS)
+            tlx.local_store(tlx.subslice(dsT_tmem_tiles[ds_buf_id], i * SUB_M, SUB_M), dsT)
+            if not USE_2CTA:
+                tlx.local_store(
+                    tlx.local_slice(ds_tiles[ds_buf_id], [0, i * SUB_M], [BLOCK_N1, SUB_M]),
+                    dsT,
+                )
+
+        # All slices stored: release the full-width tiles exactly once (a
+        # per-slice arrive would over-signal and desync the mbarrier phase).
+        # qk_empties/p_fulls now signal after dS (P is written slice-by-slice, and
+        # P aliases the QK region so qk_empties must follow the P stores); the
+        # MMA's Dot 3 (dv) / next Dot 1 (qk) simply wait a little longer. No
+        # deadlock: dS depends only on qk_fulls/dp_fulls/m/d, never on the
+        # empties/fulls this task itself is about to arrive. The local_store->TMEM
+        # lowering auto-emits tcgen05.wait::st, so p_fulls/dsT_tmem_fulls observe
+        # the completed stores; no manual wait.
+        # tlx.barrier_arrive(m_empties[m_buf_id])
+        # tlx.barrier_arrive(d_empties[d_buf_id])
+
         # dsT aliases the dP TMEM region, so dp_empties (which frees that region
-        # for reuse) must be signaled after dsT is stored, not before. The
-        # local_store->TMEM lowering auto-emits tcgen05.wait::st (+barrier), so the
-        # dsT_tmem_fulls arrive and the 2-CTA TMEM read-back below both observe the
-        # completed store; no manual wait.
+        # for reuse) must be signaled after every dsT slice is stored.
         if not REUSE_DP_FOR_DQ and not USE_2CTA:
             tlx.barrier_arrive(dp_empties[tmem_buf_id])
         # 2-CTA: exchange half of dS with peer via DSMEM, then
@@ -2089,8 +2137,8 @@ def _bwd_compute_inner_loop(
                                            [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
                 peer_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-            own_data = tlx.local_load(own_tmem)
-            tlx.local_store(own_smem, own_data)
+            dsT = tlx.local_load(own_tmem)
+            tlx.local_store(own_smem, dsT)
             peer_data = tlx.local_load(peer_tmem)
             # Signal dp_empties right after TMEM reload is done —
             # dsT_tmem is no longer needed, MMA can overwrite dp/dq TMEM.
@@ -2107,7 +2155,8 @@ def _bwd_compute_inner_loop(
             )
             # NOTE: ds_peer_fulls wait + ds_fulls signal moved to relay task.
         else:
-            tlx.local_store(ds_tiles[ds_buf_id], dsT)
+            # ds_tiles was written slice-by-slice inside the dS loop above; just
+            # fence the SMEM stores and signal them ready once.
             tlx.fence("async_shared")
             tlx.barrier_arrive(ds_fulls[ds_buf_id])
             tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
