@@ -180,7 +180,14 @@ public:
     // dependency chain (add→and→zext→add) that helps hide WGMMA latency.
     Value fullAddrb128 = tb.add(baseSrcb128, tb.i32_val(smemByteOffsetb128));
     Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x3FFF));
-    Value addr64 = tb.zext(i64_ty, addrMasked);
+    // Optional runtime perturbation: add `arg` before the zext and subtract it
+    // back after. The net value is unchanged, but because `arg` is an SSA
+    // operand (not a constant) LLVM/ptxas cannot fold the add/sub away, so it
+    // breaks CSE of otherwise-identical descriptor computations. Null => no-op.
+    Value toZext = arg ? tb.add(addrMasked, arg) : addrMasked;
+    Value addr64 = tb.zext(i64_ty, toZext);
+    if (arg)
+      addr64 = tb.sub(addr64, tb.zext(i64_ty, arg));
     Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addr64);
     return descVal;
   }
@@ -191,10 +198,14 @@ public:
 
   MMASMEMDescriptor &getDescriptor() { return desc; }
 
+  // Set the optional runtime address-perturbation operand used in smemLoad.
+  void setArg(Value v) { arg = v; }
+
 private:
   MMASMEMDescriptor desc;
   Value baseSrcb128;
   LinearLayout ll;
+  Value arg = nullptr;
 
   static FailureOr<MMASMEMDescriptor>
   getDescriptor(Location loc, const LinearLayout &ll,

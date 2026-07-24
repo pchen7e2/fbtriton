@@ -260,7 +260,8 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<std::vector<int32_t>> offsetBases,
               std::vector<std::vector<int32_t>> blockBases, int rank) {
              // Build #ttg.padded_shared from explicit linear bases ({offset,
-             // block}), so a caller can pin a swizzled layout, not just identity.
+             // block}), so a caller can pin a swizzled layout, not just
+             // identity.
              if (intervals.size() != paddings.size())
                throw std::runtime_error(
                    "make_padded_shared_encoding_attr_with_bases: intervals and "
@@ -607,16 +608,21 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &d, std::optional<Value> useD,
               std::optional<Value> pred, bool twoCTAs,
-              std::vector<Value> mBarriers, bool isAsync) -> void {
+              std::vector<Value> mBarriers, bool isAsync,
+              std::optional<Value> arg) -> void {
              Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
              std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
              auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
-             self.create<ttng::TCGen5MMAOp>(
+             auto mma = self.create<ttng::TCGen5MMAOp>(
                  tokType, a, b, d, Value(),
                  useD.has_value() ? useD.value() : predTrue /*useD*/,
                  pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
                  /*multicast=*/false, ValueRange(mBarriers),
                  ValueRange(barrierPreds), isAsync);
+             // Optional *runtime* address-perturbation knob forwarded to
+             // smemLoad (see MMAHelpers.h). SSA operand, so it can't be folded.
+             if (arg.has_value())
+               mma.getArgMutable().assign(arg.value());
            })
       .def("create_tcgen5_dot_scaled",
            [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,

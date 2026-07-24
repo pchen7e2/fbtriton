@@ -394,6 +394,10 @@ struct DotConversion {
   SmallVector<int64_t> shapeB;
   int numBitsPerElementA;
   int numBitsPerElementB;
+  // Optional runtime SMEM-address perturbation operand forwarded to
+  // DotOpMmaSmemLoader::smemLoad (see MMAHelpers.h). Null => no-op; set from
+  // the (lowered) TCGen5MMAOp `arg` operand.
+  Value arg = nullptr;
   GetAccAddressFn getAccAddress;
   CreateMMAInstFn createMMAInst;
 };
@@ -503,6 +507,7 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
              << aTensorTy << " for MMAv5 instruction shape [" << mmaSizeM
              << ", " << mmaSizeK << "]";
     }
+    loader->setArg(op.arg);
     aLoader = std::make_unique<DotOpMmaSmemLoader>(std::move(*loader));
     transA = ((DotOpMmaSmemLoader *)aLoader.get())->getDescriptor().transposed;
   }
@@ -516,6 +521,7 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
            << bTensorTy << " for MMAv5 instruction shape [" << mmaSizeK << ", "
            << mmaSizeN << "]";
   }
+  bLoader->setArg(op.arg);
   bool transB = !bLoader->getDescriptor().transposed;
 
   if (aTensorTy.getElementType().isF32() && (transA || transB)) {
@@ -581,6 +587,7 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
   dot.shapeB = getShapePerCTA(bTensorTy);
   dot.numBitsPerElementA = aTensorTy.getElementTypeBitWidth();
   dot.numBitsPerElementB = bTensorTy.getElementTypeBitWidth();
+  dot.arg = adaptor.getArg();
 
   DotOpMmaV5TmemLoader dLoader =
       DotOpMmaV5TmemLoader::build(loc, rewriter, dTensorTy, adaptor.getD());

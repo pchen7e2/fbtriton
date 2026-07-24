@@ -956,6 +956,13 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     I1:$pred,
     Variadic<TTG_MemDescType>:$barriers,
     Variadic<I1>:$barrier_preds,
+    // Optional *runtime* i32 knob threaded to the SMEM operand address
+    // computation in smemLoad: it is added before the zext and subtracted back
+    // after, so the net address is unchanged but the extra add/sub break
+    // CSE/folding of otherwise-identical descriptor computations. Because it is
+    // an SSA operand (not a constant attribute), LLVM/ptxas cannot fold it away.
+    // Absent => no perturbation.
+    Optional<I32>:$arg,
     UnitAttr:$is_async,
     UnitAttr:$two_ctas,
     UnitAttr:$multicast,
@@ -977,6 +984,7 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
   let assemblyFormat = [{
     $a `,` $b `,` $d `` custom<Token>($acc_dep, type($token)) `,` $useD`,`
     $pred `` custom<BarriersAndPreds>($barriers, $barrier_preds)
+    (`arg` $arg^ `:` type($arg))?
     attr-dict `:` qualified(type($a)) `,` qualified(type($b)) `,`
     qualified(type($d)) (`,` qualified(type($barriers))^)?
   }];

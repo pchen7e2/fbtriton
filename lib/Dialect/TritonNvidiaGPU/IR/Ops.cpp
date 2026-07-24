@@ -866,7 +866,8 @@ void TCGen5MMAOp::build(OpBuilder &builder, OperationState &state, Type token,
     isAsync = true;
   }
   build(builder, state, token, a, b, d, accDep, useD, pred, barriers,
-        barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
+        barrierPreds, /*arg=*/Value(),
+        isAsync ? builder.getUnitAttr() : UnitAttr(),
         twoCtas ? builder.getUnitAttr() : UnitAttr(),
         multicast ? builder.getUnitAttr() : UnitAttr(),
         isUnsigned ? builder.getUnitAttr() : UnitAttr());

@@ -90,6 +90,7 @@ def async_dot(
     force_async: bool = False,
     input_precision=None,
     out_dtype=tl.float32,
+    arg=None,
     _semantic=None,
 ) -> tl.tensor:
     """
@@ -112,6 +113,14 @@ def async_dot(
         D is the output tile in registers
 
     input_precision can be one of: tf32, tf32x3, ieee.
+
+    arg is an optional *runtime* i32 value (a scalar tl.tensor, or None)
+    forwarded to the Blackwell (tcgen5) MMA op's `arg` operand. It perturbs the
+    SMEM operand address computation in smemLoad (add before the zext, subtract
+    after -- value-preserving when arg evaluates to 0 at runtime). Because it is
+    an SSA operand rather than a constant, LLVM/ptxas cannot fold it away, so it
+    breaks CSE of otherwise-identical MMA descriptor computations. Ignored on
+    Hopper (wgmma). Defaults to None (no perturbation).
     """
 
     # Perform dot_precheck shared by tl.dot
@@ -152,8 +161,19 @@ def async_dot(
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
         use_acc_handle = _get_use_acc_handle(use_acc, _semantic.builder)
+        if arg is None:
+            arg_handle = None
+        elif isinstance(arg, tl.tensor):
+            # Runtime i32 value: SSA operand, so LLVM/ptxas cannot fold it.
+            arg_handle = arg.handle
+        else:
+            # Python int / constexpr: materialize an i32 constant. NOTE: a
+            # compile-time-constant arg is foldable and will not survive
+            # LLVM/ptxas -- pass a runtime tl.tensor for a perturbation that
+            # actually breaks CSE.
+            arg_handle = _semantic.builder.get_int32(int(tl._unwrap_if_constexpr(arg)))
         output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, two_ctas,
-                                                     handles, is_async)
+                                                     handles, is_async, arg_handle)
         return tl.tensor(output, tl.void)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
