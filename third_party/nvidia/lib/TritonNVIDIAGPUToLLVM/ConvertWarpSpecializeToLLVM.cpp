@@ -144,18 +144,27 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     int numWorkerWarps = totalNumWarpsAttr.getInt() - defaultNumWarps;
     int startRegs = maxnreg.getInt();
 
+    // The user can pin the worker-warp register floor via
+    // `tlx.async_tasks(initialization_non_default_registers=N)`. When set, it
+    // overrides the default (24) and is treated as authoritative below.
+    std::optional<int> userLowRegs =
+        tlx::getInitializationNonDefaultRegisters(func);
+
     // First determine how many extra registers the default warp group can get
     // if the workers surrender the maximum number of registers.
-    lowRegs = 24;
+    lowRegs = userLowRegs.value_or(24);
     int extraRegs = (startRegs - lowRegs) * numWorkerWarps / defaultNumWarps;
     defRegs = (startRegs + extraRegs) / 8 * 8;
 
     // If the default warp group goes over 256 registers, the workers don't need
-    // to give up this much.
+    // to give up this much -- unless the user pinned the worker register count,
+    // in which case honor it and only clamp the default warp group.
     if (defRegs > 256) {
       defRegs = 256;
-      int giveRegs = (defRegs - startRegs) * defaultNumWarps / numWorkerWarps;
-      lowRegs = (startRegs - giveRegs) / 8 * 8;
+      if (!userLowRegs) {
+        int giveRegs = (defRegs - startRegs) * defaultNumWarps / numWorkerWarps;
+        lowRegs = (startRegs - giveRegs) / 8 * 8;
+      }
     }
   }
 

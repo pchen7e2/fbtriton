@@ -1199,6 +1199,163 @@ llvm.func @dynamic_register_reallocation_overalloc() attributes {allocation.offs
 
 // -----
 
+module attributes {ttg.maxnreg = 80 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 16 : i32, tlx.initialization_non_default_registers = 40 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// `tlx.initialization_non_default_registers = 40` overrides the default worker
+// register floor of 24: every worker decrease/restore now targets 40, and the
+// default warp group budget shrinks accordingly (248 -> 200) since the workers
+// surrender fewer registers.
+// CHECK-LABEL: @init_non_default_registers
+llvm.func @init_non_default_registers() attributes {allocation.offset = 0 : i32} {
+  // CHECK-DAG: [[C1:%.*]] = llvm.mlir.constant(1 : i32)
+
+  // CHECK: cond_br %{{.*}}, [[ENTRY:\^.*]], [[SWITCH_LOOP:\^.*]]
+
+  // CHECK: [[SWITCH_LOOP]]:
+  // CHECK-NEXT: nvvm.setmaxregister decrease 40
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: llvm.switch
+  // CHECK-NEXT: 0: [[PARTITION0:\^.*]],
+  // CHECK-NEXT: 1: [[PARTITION1:\^.*]],
+  // CHECK-NEXT: 2: [[PARTITION2:\^.*]],
+  // CHECK-NEXT: 3: [[EXIT:\^.*]]
+
+  // CHECK: [[PARTITION0]]:
+  // CHECK-NEXT: nvvm.setmaxregister increase 80
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: "partition0"()
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.setmaxregister decrease 40
+
+  // CHECK: [[PARTITION1]]:
+  // CHECK-NEXT: nvvm.setmaxregister increase 48
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: "partition1"()
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.setmaxregister decrease 40
+
+  // CHECK: [[PARTITION2]]:
+  // CHECK-NEXT: nvvm.setmaxregister increase 128
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: "partition2"()
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.setmaxregister decrease 40
+
+  // CHECK: [[ENTRY]]:
+  // CHECK-NEXT: nvvm.setmaxregister increase 200
+
+  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: setmaxregister decrease 152
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: "default"
+  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: setmaxregister increase 200
+
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 12>, actualRegisters = array<i32: 152, 80, 48, 128>}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  }
+  partition1() num_warps(4) {
+    "partition1"() : () -> ()
+    ttg.warp_return
+  }
+  partition2() num_warps(4) {
+    "partition2"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
+module attributes {ttg.maxnreg = 128 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 16 : i32, tlx.initialization_non_default_registers = 40 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// Overalloc case: with maxnreg=128 the default warp group would exceed 256
+// registers, which normally walks the worker floor back up (to 80 here). Because
+// the user pinned `tlx.initialization_non_default_registers = 40`, that walk-back
+// is skipped: the workers stay at 40 while only the default group is clamped to
+// 256 (so the switch-loop decrease stays 40, not the recomputed 80).
+// CHECK-LABEL: @init_non_default_registers_overalloc
+llvm.func @init_non_default_registers_overalloc() attributes {allocation.offset = 0 : i32} {
+  // CHECK-DAG: [[C1:%.*]] = llvm.mlir.constant(1 : i32)
+
+  // CHECK: cond_br %{{.*}}, [[ENTRY:\^.*]], [[SWITCH_LOOP:\^.*]]
+
+  // CHECK: [[SWITCH_LOOP]]:
+  // CHECK-NEXT: nvvm.setmaxregister decrease 40
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: llvm.switch
+  // CHECK-NEXT: 0: [[PARTITION0:\^.*]],
+  // CHECK-NEXT: 1: [[PARTITION1:\^.*]],
+  // CHECK-NEXT: 2: [[PARTITION2:\^.*]],
+  // CHECK-NEXT: 3: [[EXIT:\^.*]]
+
+  // CHECK: [[PARTITION0]]:
+  // CHECK-NEXT: nvvm.setmaxregister increase 80
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: "partition0"()
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.setmaxregister decrease 40
+
+  // CHECK: [[PARTITION1]]:
+  // CHECK-NEXT: nvvm.setmaxregister increase 192
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: "partition1"()
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.setmaxregister decrease 40
+
+  // CHECK: [[PARTITION2]]:
+  // CHECK-NEXT: nvvm.setmaxregister increase 192
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: "partition2"()
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.setmaxregister decrease 40
+
+  // CHECK: [[ENTRY]]:
+  // CHECK-NEXT: nvvm.setmaxregister increase 256
+
+  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: setmaxregister decrease 104
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: "default"
+  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: setmaxregister increase 256
+
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 12>, actualRegisters = array<i32: 104, 80, 192, 192>}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  }
+  partition1() num_warps(4) {
+    "partition1"() : () -> ()
+    ttg.warp_return
+  }
+  partition2() num_warps(4) {
+    "partition2"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
 module attributes {tlx.enable_paired_cta_mma = true, "tlx.cluster_sync_kernel_init" = true, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 6 : i32, "ttg.cluster-dim-x" = 2 : i32} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>

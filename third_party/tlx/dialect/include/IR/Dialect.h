@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <optional>
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -36,6 +37,8 @@ constexpr static char AttrClusterSyncKernelInitName[] =
 constexpr static char AttrClusterSyncKernelCleanupName[] =
     "tlx.cluster_sync_kernel_cleanup";
 constexpr static char AttrUserPostWsSyncName[] = "tlx.user_post_ws_sync";
+constexpr static char AttrInitializationNonDefaultRegistersName[] =
+    "tlx.initialization_non_default_registers";
 
 bool tlxEnablePairedMMA(Operation *op);
 
@@ -62,6 +65,16 @@ void setClusterSyncKernelCleanupOnMod(Operation *op, bool value);
 // pass.
 bool hasUserPostWsSync(Operation *op);
 void setUserPostWsSyncOnMod(Operation *op, bool value);
+
+// `tlx.initialization_non_default_registers`: overrides the default number of
+// registers (24) the non-default (worker) warps surrender to at warp-specialize
+// initialization. When set, it is authoritative -- the register walk-back that
+// normally raises the worker count when the default warp group would exceed 256
+// registers is skipped, so the workers keep exactly this many. Propagated from
+// `tlx.async_tasks(initialization_non_default_registers=N)` in the Fixup pass
+// and consumed by ConvertWarpSpecializeToLLVM. Returns nullopt when unset.
+std::optional<int> getInitializationNonDefaultRegisters(Operation *op);
+void setInitializationNonDefaultRegistersOnMod(Operation *op, int value);
 
 // Returns true if the kernel uses clusters (clusterDims product > 1).
 // Subsumes tlxEnablePairedMMA: paired CTA MMA always implies clustering.

@@ -459,6 +459,34 @@ void mlir::triton::tlx::setUserPostWsSyncOnMod(Operation *op, bool value) {
                   BoolAttr::get(module->getContext(), value));
 }
 
+std::optional<int>
+mlir::triton::tlx::getInitializationNonDefaultRegisters(Operation *op) {
+  assert(op != nullptr && "expecting nonnull op for checking initialization "
+                          "non-default registers");
+  auto module = getModuleOp(op);
+  assert(module != nullptr &&
+         "expecting op nested in a module for checking initialization "
+         "non-default registers");
+  auto attr = module->getAttrOfType<IntegerAttr>(
+      AttrInitializationNonDefaultRegistersName);
+  if (!attr)
+    return std::nullopt;
+  return static_cast<int>(attr.getInt());
+}
+
+void mlir::triton::tlx::setInitializationNonDefaultRegistersOnMod(Operation *op,
+                                                                  int value) {
+  assert(op != nullptr && "expecting nonnull op for setting initialization "
+                          "non-default registers");
+  auto module = getModuleOp(op);
+  assert(module != nullptr &&
+         "expecting op nested in a module for setting initialization "
+         "non-default registers");
+  module->setAttr(
+      AttrInitializationNonDefaultRegistersName,
+      IntegerAttr::get(IntegerType::get(module->getContext(), 32), value));
+}
+
 bool mlir::triton::tlx::tlxIsClustered(Operation *op) {
   assert(op != nullptr && "expecting nonnull op for checking cluster dims");
   auto moduleOp = getModuleOp(op);

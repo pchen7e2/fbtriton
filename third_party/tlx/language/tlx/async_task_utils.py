@@ -55,14 +55,21 @@ class async_tasks:
         exclusive=False,
         no_ending_cluster_sync=False,
         mbarrier_try_wait_suspend_ns=None,
+        initialization_non_default_registers=None,
         **kwargs,
     ):
         self.exclusive = core._unwrap_if_constexpr(exclusive)
         self.no_ending_cluster_sync = core._unwrap_if_constexpr(no_ending_cluster_sync)
         self.mbarrier_try_wait_suspend_ns = core._unwrap_if_constexpr(mbarrier_try_wait_suspend_ns)
+        self.initialization_non_default_registers = core._unwrap_if_constexpr(initialization_non_default_registers)
         if self.mbarrier_try_wait_suspend_ns is not None:
             if not isinstance(self.mbarrier_try_wait_suspend_ns, int) or self.mbarrier_try_wait_suspend_ns < 0:
                 raise ValueError("mbarrier_try_wait_suspend_ns must be a non-negative integer")
+        if self.initialization_non_default_registers is not None:
+            if not isinstance(self.initialization_non_default_registers,
+                              int) or self.initialization_non_default_registers <= 0:
+                raise ValueError("initialization_non_default_registers must be a positive integer")
+            _validate_num_regs(self.initialization_non_default_registers)
 
     def __enter__(self):
         return self

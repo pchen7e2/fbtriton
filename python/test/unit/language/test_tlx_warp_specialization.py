@@ -798,3 +798,83 @@ def test_single_warp_specialize(device):
     single_ptx, multi_ptx = single.asm["ptx"], multi.asm["ptx"]
     assert single_ptx.count("setmaxnreg") < multi_ptx.count("setmaxnreg")
     assert single_ptx.count("barrier.sync") < multi_ptx.count("barrier.sync")
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="warp_specialize register realloc lowering targets Blackwell")
+def test_initialization_non_default_registers(device):
+    # `tlx.async_tasks(initialization_non_default_registers=N)` pins the register
+    # floor the non-default (worker) warps surrender to at warp-specialize
+    # initialization, overriding the compiler default of 24. The Fixup pass
+    # propagates it to the `tlx.initialization_non_default_registers` module
+    # attribute, and ConvertWarpSpecializeToLLVM emits the worker setmaxnreg
+    # decrease/restore against that value.
+    @triton.jit
+    def add2_ws_init_regs_kernel(x_ptr, y_ptr, z_ptr, a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: tl.constexpr,
+                                 INIT_REGS: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks(initialization_non_default_registers=INIT_REGS):
+            with tlx.async_task("default"):
+                offs = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_elements
+                tl.store(z_ptr + offs, tl.load(x_ptr + offs, mask=mask) + tl.load(y_ptr + offs, mask=mask), mask=mask)
+            with tlx.async_task(num_warps=4, num_regs=232):
+                offs = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_elements
+                tl.store(c_ptr + offs, tl.load(a_ptr + offs, mask=mask) + tl.load(b_ptr + offs, mask=mask), mask=mask)
+
+    @triton.jit
+    def add2_ws_plain_kernel(x_ptr, y_ptr, z_ptr, a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                offs = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_elements
+                tl.store(z_ptr + offs, tl.load(x_ptr + offs, mask=mask) + tl.load(y_ptr + offs, mask=mask), mask=mask)
+            with tlx.async_task(num_warps=4, num_regs=232):
+                offs = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_elements
+                tl.store(c_ptr + offs, tl.load(a_ptr + offs, mask=mask) + tl.load(b_ptr + offs, mask=mask), mask=mask)
+
+    torch.manual_seed(0)
+    n = 98432
+    BLOCK_SIZE = 1024
+    x, y, a, b = (torch.rand(n, device=device) for _ in range(4))
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+
+    def run_override(init_regs):
+        z, c = torch.empty_like(x), torch.empty_like(a)
+        compiled = add2_ws_init_regs_kernel[grid](x, y, z, a, b, c, n, BLOCK_SIZE=BLOCK_SIZE, INIT_REGS=init_regs)
+        torch.testing.assert_close(z, x + y, check_dtype=False)
+        torch.testing.assert_close(c, a + b, check_dtype=False)
+        return compiled
+
+    def setmaxnreg_values(ptx):
+        return re.findall(r"setmaxnreg\S*\s+(\d+)", ptx)
+
+    # Two distinct pinned floors, both differing from the compiler default (24)
+    # and from any partition's actual register count (the 232-reg worker and the
+    # default budget), so each value can only appear in the PTX because the arg
+    # put it there.
+    k40 = run_override(40)
+    k48 = run_override(48)
+
+    # Fixup propagates the arg to the module attribute verbatim.
+    assert "tlx.initialization_non_default_registers = 40 : i32" in k40.asm["ttgir"]
+    assert "tlx.initialization_non_default_registers = 48 : i32" in k48.asm["ttgir"]
+
+    # ConvertWarpSpecializeToLLVM emits the worker setmaxnreg against the pinned
+    # floor: each compile shows its own value and not the other's.
+    regs40 = setmaxnreg_values(k40.asm["ptx"])
+    regs48 = setmaxnreg_values(k48.asm["ptx"])
+    assert "40" in regs40 and "48" not in regs40, regs40
+    assert "48" in regs48 and "40" not in regs48, regs48
+
+    # Without the arg the module attribute is absent (the workers fall back to the
+    # compiler default), and the result is still correct.
+    z, c = torch.empty_like(x), torch.empty_like(a)
+    plain = add2_ws_plain_kernel[grid](x, y, z, a, b, c, n, BLOCK_SIZE=BLOCK_SIZE)
+    torch.testing.assert_close(z, x + y, check_dtype=False)
+    torch.testing.assert_close(c, a + b, check_dtype=False)
+    assert "tlx.initialization_non_default_registers" not in plain.asm["ttgir"]

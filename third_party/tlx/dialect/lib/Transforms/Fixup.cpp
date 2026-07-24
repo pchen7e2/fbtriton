@@ -611,6 +611,7 @@ public:
       bool hasExclusiveWS = false;
       bool hasNoEndingClusterSync = false;
       std::optional<int32_t> mbarrierTryWaitSuspendNs;
+      std::optional<int32_t> initNonDefaultRegs;
       mod.walk([&](ttg::WarpSpecializeOp op) {
         ++numWarpSpecializeOps;
         if (op->hasAttr("tlx.exclusive"))
@@ -623,10 +624,23 @@ public:
           if (!mbarrierTryWaitSuspendNs || value < *mbarrierTryWaitSuspendNs)
             mbarrierTryWaitSuspendNs = value;
         }
+        if (auto attr = op->getAttrOfType<IntegerAttr>(
+                AttrInitializationNonDefaultRegistersName)) {
+          int32_t value = attr.getInt();
+          // If multiple warp_specialize ops disagree, take the smallest so the
+          // worker warps surrender to a level that satisfies every partition.
+          if (!initNonDefaultRegs || value < *initNonDefaultRegs)
+            initNonDefaultRegs = value;
+        }
       });
       if (mbarrierTryWaitSuspendNs)
         mod->setAttr("tlx.mbarrier_try_wait_suspend_ns",
                      b.getI32IntegerAttr(*mbarrierTryWaitSuspendNs));
+      // `initialization_non_default_registers`: propagate the worker-warp
+      // register floor to the module so ConvertWarpSpecializeToLLVM can
+      // override its default (24) when lowering the warp_specialize op.
+      if (initNonDefaultRegs)
+        setInitializationNonDefaultRegistersOnMod(mod, *initNonDefaultRegs);
       if (hasExclusiveWS) {
         if (numWarpSpecializeOps != 1) {
           mod.emitError()

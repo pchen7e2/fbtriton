@@ -233,3 +233,50 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// `tlx.initialization_non_default_registers` on the warp_specialize op is
+// propagated to the module so ConvertWarpSpecializeToLLVM can override the
+// default (24) worker-warp register floor.
+// CHECK: module attributes {
+// CHECK-SAME: tlx.initialization_non_default_registers = 40 : i32
+module {
+  tt.func @kernel_init_non_default_registers() {
+    ttg.warp_specialize() attributes {tlx.initialization_non_default_registers = 40 : i32}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Multiple warp_specialize ops with different worker register floors: the module
+// attribute takes the smallest so the workers surrender to a level that
+// satisfies every partition.
+// CHECK: module attributes {
+// CHECK-SAME: tlx.initialization_non_default_registers = 32 : i32
+module {
+  tt.func @kernel_init_non_default_registers_min() {
+    ttg.warp_specialize() attributes {tlx.initialization_non_default_registers = 48 : i32}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    ttg.warp_specialize() attributes {tlx.initialization_non_default_registers = 32 : i32}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}

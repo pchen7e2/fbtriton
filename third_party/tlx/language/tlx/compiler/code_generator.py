@@ -168,6 +168,7 @@ def visit_withAsyncTasks(self, node):
     exclusive = False
     no_ending_cluster_sync = False
     mbarrier_try_wait_suspend_ns = None
+    initialization_non_default_registers = None
     for kw in getattr(ws_context, "keywords", []):
         if kw.arg == "exclusive":
             exclusive = bool(_unwrap_if_constexpr(self.visit(kw.value)))
@@ -177,6 +178,11 @@ def visit_withAsyncTasks(self, node):
             mbarrier_try_wait_suspend_ns = _unwrap_if_constexpr(self.visit(kw.value))
             if not isinstance(mbarrier_try_wait_suspend_ns, int) or mbarrier_try_wait_suspend_ns < 0:
                 raise ValueError("mbarrier_try_wait_suspend_ns must be a non-negative integer")
+        elif kw.arg == "initialization_non_default_registers":
+            initialization_non_default_registers = _unwrap_if_constexpr(self.visit(kw.value))
+            if (not isinstance(initialization_non_default_registers, int) or initialization_non_default_registers <= 0
+                    or initialization_non_default_registers % 8 != 0):
+                raise ValueError("initialization_non_default_registers must be a positive integer divisible by 8")
 
     with enter_sub_region(self) as sr:
         liveins, _ = sr
@@ -296,6 +302,11 @@ def visit_withAsyncTasks(self, node):
             ws_op.set_attr(
                 "tlx.mbarrier_try_wait_suspend_ns",
                 self.builder.get_int32_attr(mbarrier_try_wait_suspend_ns),
+            )
+        if initialization_non_default_registers is not None:
+            ws_op.set_attr(
+                "tlx.initialization_non_default_registers",
+                self.builder.get_int32_attr(initialization_non_default_registers),
             )
 
         # dry visit async task body to calculate captures
