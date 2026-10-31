@@ -372,6 +372,37 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         )
 
 
+class partitioned_shared_layout_encoding(shared_layout_encoding):
+    """Split a tensor's pieces between physical LDS partitions on gfx1250.
+
+    ``partition_layout`` describes one piece. Along ``partition_dim``, each
+    of ``num_groups`` groups contains ``num_partitions`` consecutive pieces.
+    """
+
+    def __init__(self, num_partitions, num_groups, partition_dim, partition_layout):
+        super().__init__()
+        self.num_partitions = int(num_partitions)
+        self.num_groups = int(num_groups)
+        self.partition_dim = int(partition_dim)
+        self.partition_layout = tl._unwrap_if_constexpr(partition_layout)
+        for name, value in (("num_partitions", self.num_partitions), ("num_groups", self.num_groups)):
+            if value <= 0 or value & (value - 1):
+                raise ValueError(f"{name} must be a positive power of two")
+        if self.partition_dim < 0:
+            raise ValueError("partition_dim must be non-negative")
+        if not isinstance(self.partition_layout, shared_layout_encoding):
+            raise TypeError("partition_layout must be a shared-memory layout")
+
+    def make_permute(self, dims):
+        return partitioned_shared_layout_encoding(self.num_partitions, self.num_groups,
+                                                  tuple(dims).index(self.partition_dim),
+                                                  self.partition_layout.make_permute(dims))
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_partitioned_shared_encoding_attr(self.num_partitions, self.num_groups, self.partition_dim,
+                                                             self.partition_layout.to_ir(builder))
+
+
 class shared_linear_layout_encoding(shared_layout_encoding):
     """Explicit linear shared-memory mapping used by Gluon K-tile paths.
 
