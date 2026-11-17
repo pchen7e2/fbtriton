@@ -586,6 +586,7 @@ struct TensorMemoryLoadOpConversion
 
     Value resultStruct = packUniqueTensorElements(
         loc, getTypeConverter(), resultVals, rewriter, op.getType());
+    // TMEM waits are inserted at the TTGIR level for memory ordering.
 
     // tcgen05.ld.red honors true register dependencies without a wait.
     if (redOp)

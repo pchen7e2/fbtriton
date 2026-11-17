@@ -1350,9 +1350,9 @@ class CUDABackend(BaseBackend):
         instrument(pm, point="ttgpuir-to-llvmir", context=mod.context)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
-        nvidia.passes.ttgpuir.add_membar(pm, capability, ptx_version)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
-        nvidia.passes.ttnvgpuir.add_optimize_mbarrier_arrivals(pm)
+        nvidia.passes.ttgpuir.add_membar(pm, capability, ptx_version)
+        nvidia.passes.ttnvgpuir.add_tmem_wait_insertion(pm)
         if is_enabled(options, "consan"):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
             passes.gluon.add_canonicalizer(pm)

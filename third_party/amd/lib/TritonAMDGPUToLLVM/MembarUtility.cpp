@@ -14,16 +14,16 @@
 
 namespace mlir::triton::AMD {
 namespace {
-// Returns true if
-// 1) op2 is a LocalLoad synced via AsyncWait and op1 is an AsyncLoad into the
-//    same buffer (RAW).
-// 2) both are AsyncLoad
+// Returns true for two async LDS writes, or a producer-to-consumer dependency
+// ordered by AsyncWait. AsyncWait does not release the consumed LDS slice for a
+// later async write.
 bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
+                                       bool op1IsRead, bool op2IsRead,
                                        Allocation *allocation) {
-  auto isAsyncLoad = [](Operation *op) {
+  auto isAsyncLDSWrite = [](Operation *op) {
     return op->hasTrait<mlir::OpTrait::GlobalToLocalCopyTrait>();
   };
-  auto isLocalLoadWithAsyncWaitToken = [](Operation *op) {
+  auto isLocalLoadSyncedViaAsyncWait = [](Operation *op) {
     auto localLoad = llvm::dyn_cast<triton::gpu::LocalLoadOp>(op);
     return localLoad && isSyncedViaAsyncWait(localLoad);
   };
@@ -47,13 +47,17 @@ bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
         .Default([](Operation *) { return SmallVector<Value>{}; });
   };
 
-  // Early return if neither operands are an AsyncLoad
-  if (!isAsyncLoad(op1) && !isAsyncLoad(op2)) {
-    return false;
-  }
-  // Filter if both operands are an AsyncLoad
-  if (isAsyncLoad(op1) && isAsyncLoad(op2)) {
+  // Async writes are ordered by their async synchronization, not a workgroup
+  // barrier, regardless of whether their destination buffers alias.
+  if (isAsyncLDSWrite(op1) && isAsyncLDSWrite(op2))
     return true;
+
+  // Only filter a RAW dependency from a prior async LDS write to its local
+  // consumer. In particular, never filter the opposite LocalLoad-to-prefetch
+  // WAR dependency: a wait says nothing about consumer completion.
+  if (op1IsRead || !op2IsRead || !isAsyncLDSWrite(op1) ||
+      !isLocalLoadSyncedViaAsyncWait(op2)) {
+    return false;
   }
 
   SmallVector<Value> op1Memdescs = getMemdescValues(op1);
@@ -79,9 +83,7 @@ bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
   if (!sameBuffer)
     return false;
 
-  // Filter only the RAW direction: the AsyncWait orders the synced LocalLoad
-  // after the AsyncLoad, but not a later refill of the same buffer (WAR).
-  return isLocalLoadWithAsyncWaitToken(op2);
+  return true;
 }
 
 // A deliberately narrow reuse rule. Equal concrete tensor types select
@@ -146,10 +148,10 @@ bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
 }
 } // namespace
 
-bool membarFilter(Operation *op1, Operation *op2, bool /*op1IsRead*/,
-                  bool /*op2IsRead*/, Allocation *allocation,
-                  const AllocationSlice &, const AllocationSlice &) {
-  return (filterAsyncLocalLoadsDependencies(op1, op2, allocation) ||
+bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
+                  bool op2IsRead, Allocation *allocation) {
+  return (filterAsyncLocalLoadsDependencies(op1, op2, op1IsRead, op2IsRead,
+                                            allocation) ||
           filterLDSMemoryBarriersDependencies(op1, op2));
 }
 

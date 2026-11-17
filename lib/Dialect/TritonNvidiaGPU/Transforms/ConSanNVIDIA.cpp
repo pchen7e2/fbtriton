@@ -185,8 +185,7 @@ public:
       info->pred = expectOp.getPred();
       info->barriers.push_back(
           {expectOp.getBarrier(), nullptr,
-           expectOp.getPerWarp() ? ttg::lookupNumWarps(expectOp) : 1,
-           MemEffectsOpInfo::BarrierTrackingMode::Frontier,
+           /*count=*/1, MemEffectsOpInfo::BarrierTrackingMode::Frontier,
            /*txCount=*/static_cast<int>(expectOp.getSize())});
     }
     if (auto copyOp = dyn_cast<ttng::TMEMCopyOp>(op)) {

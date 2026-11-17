@@ -365,25 +365,16 @@ class BarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::BarrierOp> {
 public:
   BarrierOpConversion(const LLVMTypeConverter &converter,
-                      const TargetInfoBase &targetInfo, PatternBenefit benefit)
-      : ConvertOpToLLVMPattern<triton::gpu::BarrierOp>(converter, benefit),
-        targetInfo(targetInfo) {}
+                      PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::gpu::BarrierOp>(converter, benefit) {}
   using OpAdaptor = typename triton::gpu::BarrierOp::Adaptor;
 
   LogicalResult
   matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.isWarp()) {
-      targetInfo.warpSync(op.getLoc(), rewriter);
-      rewriter.eraseOp(op);
-      return success();
-    }
     rewriter.replaceOpWithNewOp<mlir::gpu::BarrierOp>(op);
     return success();
   }
-
-private:
-  const TargetInfoBase &targetInfo;
 };
 
 struct LocalGatherOpConversion : public ConvertOpToLLVMPattern<LocalGatherOp> {
@@ -875,7 +866,7 @@ void mlir::triton::populateMemoryOpToLLVMPatterns(
                                                   benefit);
   patterns.add<AsyncRemoteShmemCopyOpConversion>(typeConverter, targetInfo,
                                                  benefit);
-  patterns.add<BarrierOpConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<BarrierOpConversion>(typeConverter, benefit);
   patterns.add<AtomicLoadOpConversion>(typeConverter, targetInfo,
                                        axisInfoAnalysis, benefit);
   patterns.add<AtomicPollOpConversion>(typeConverter, targetInfo, benefit);

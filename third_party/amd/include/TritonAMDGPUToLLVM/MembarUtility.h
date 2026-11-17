@@ -7,7 +7,6 @@
 
 namespace mlir {
 class DialectRegistry;
-struct AllocationSlice;
 struct MembarScratchSync;
 } // namespace mlir
 
@@ -22,9 +21,8 @@ namespace mlir::triton::AMD {
 // refilled: every workgroup consumer must release a cooperatively owned slice
 // before any wave overwrites it. Distinct constant memdesc_index slices are
 // proven independent by the generic Membar allocation-slice analysis.
-bool membarFilter(Operation *op1, Operation *op2, bool /*op1IsRead*/,
-                  bool /*op2IsRead*/, Allocation *allocation,
-                  const AllocationSlice &, const AllocationSlice &);
+bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
+                  bool op2IsRead, Allocation *allocation);
 
 // Pair the allocated warp-local scratch reuse proof with its required leading
 // wave fence. Callers using only membarFilter retain CTA synchronization for

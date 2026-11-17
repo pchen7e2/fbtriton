@@ -546,9 +546,11 @@ def TTNG_InvalBarrierOp
   let assemblyFormat = "$alloc attr-dict `:` qualified(type($alloc))";
 }
 
-def TTNG_BarrierExpectOp : TTNG_Op<"barrier_expect", [
-    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier", "isPerWarp"]>,
-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+def TTNG_BarrierExpectOp
+    : TTNG_Op<
+          "barrier_expect", [DeclareOpInterfaceMethods<PredicatedOpInterface>,
+                             DeclareOpInterfaceMethods<
+                                 MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "Signal a barrier of an expected number of bytes to be copied.";
 
   let description = [{
@@ -557,30 +559,18 @@ def TTNG_BarrierExpectOp : TTNG_Op<"barrier_expect", [
     been copied. The optional `fromCTA` attribute is a CTA-ID
     basis-selection mask: set bits are preserved and unset bits are zeroed
     when selecting the CTA that routes the arrival to each per-CTA barrier.
-
-    The compiler-owned `per_warp` flag distributes each contributing CTA's
-    expectation across its execution region's warps. Each warp publishes its
-    prior effects and contributes one arrival and an equal share of the
-    expected bytes. The barrier's initialization count must be scaled to match;
-    `size` remains the byte count per contributing CTA and target barrier.
   }];
 
   let hasVerifier = 1;
   let hasCanonicalizeMethod = 1;
-  let arguments = (ins
-    Arg<TTG_MemDescType, "", BarrierSharedWrite>:$alloc,
-    I32Attr:$size,
-    I1:$pred,
-    OptionalAttr<I32Attr>:$fromCTA,
-    UnitAttr:$per_warp
-  );
+  let arguments = (ins Arg<TTG_MemDescType, "", BarrierSharedWrite>:$alloc,
+      I32Attr:$size, I1:$pred, OptionalAttr<I32Attr>:$fromCTA);
 
-  let builders = [
-    OpBuilder<(ins "Value":$alloc, "uint32_t":$size, "Value":$pred), [{
-      build($_builder, $_state, alloc, size, pred, /*fromCTA=*/IntegerAttr(),
-            /*per_warp=*/false);
-    }]>
-  ];
+  let builders = [OpBuilder<
+      (ins "Value":$alloc, "uint32_t":$size, "Value":$pred), [{
+      build($_builder, $_state, alloc, $_builder.getI32IntegerAttr(size), pred,
+            /*fromCTA=*/IntegerAttr());
+    }]>];
 
   let assemblyFormat = [{
     $alloc `,` $size attr-dict `,` $pred `:` qualified(type($alloc))
@@ -636,22 +626,17 @@ def TTNG_WaitBarrierOp
   }];
 }
 
-def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier", [
-    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier", "isPerWarp"]>,
-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+def TTNG_ArriveBarrierOp
+    : TTNG_Op<
+          "arrive_barrier", [DeclareOpInterfaceMethods<PredicatedOpInterface>,
+                             DeclareOpInterfaceMethods<
+                                 MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "perform the arrive operation on an mbarrier";
   let description = [{
     The `ttng.arrive_barrier` operation performs the "arrive" operation on an
     mbarrier object in shared memory. The operation requires a `count` attribute
     of at least 1 and decreases the pending arrival count of the mbarrier by
     the specified count.
-
-    The compiler-owned `per_warp` flag selects an arrival from each of the
-    execution region's warps. The compiler may set this flag before final count
-    scaling. Before lowering, the count must be divisible by the warp count;
-    it remains the total decrement per source CTA and target barrier. Membar
-    inserts the required warp synchronization before each warp contributes its
-    equal share to every routed target.
 
     When `multicastCTA` is non-zero, the arrive is multicast across the cluster.
     Each bit set in the mask identifies a CTA ID dimension to multicast
@@ -676,16 +661,10 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier", [
     ```
   }];
 
-  let arguments = (ins
-    Arg<TTG_MemDescType, "", BarrierSharedReadWrite>:$alloc,
-    I32Attr:$count,
-    Optional<I1>:$pred,
-    OptionalAttr<I32Attr>:$fromCTA,
-    DefaultValuedOptionalAttr<I32Attr, "0">:$multicastCTA,
-    UnitAttr:$perThread,
-    UnitAttr:$per_warp,
-    OptionalAttr<DictionaryAttr>:$constraints
-  );
+  let arguments = (ins Arg<TTG_MemDescType, "", BarrierSharedReadWrite>:$alloc,
+      I32Attr:$count, Optional<I1>:$pred, OptionalAttr<I32Attr>:$fromCTA,
+      DefaultValuedOptionalAttr<I32Attr, "0">:$multicastCTA,
+      UnitAttr:$perThread, OptionalAttr<DictionaryAttr>:$constraints);
 
   let assemblyFormat = [{
     $alloc `,` $count (`,` $pred^)? attr-dict `:` qualified(type($alloc))
@@ -693,33 +672,33 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier", [
 
   let builders =
       [OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
-      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, /*perThread=*/false, /*per_warp=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred), [{
-      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, /*perThread=*/false, /*per_warp=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count,
                      "uint32_t":$multicastCTA, "Value":$pred),
                  [{
-      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), multicastCTA, /*perThread=*/false, /*per_warp=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), multicastCTA, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "IntegerAttr":$fromCTA, "uint32_t":$multicastCTA),
                  [{
-      return build($_builder, $_state, alloc, count, pred, fromCTA, multicastCTA, /*perThread=*/false, /*per_warp=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, pred, fromCTA, multicastCTA, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
-      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, /*per_warp=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread),
                  [{
-      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, /*per_warp=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread, "DictionaryAttr":$constraints),
                  [{
-      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, /*per_warp=*/false, constraints);
+      return build($_builder, $_state, alloc, count, pred, /*fromCTA=*/IntegerAttr(), /*multicastCTA=*/0u, perThread, constraints);
     }]>];
 
   let extraClassDeclaration = [{

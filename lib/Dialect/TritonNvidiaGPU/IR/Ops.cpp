@@ -861,12 +861,6 @@ static LogicalResult canonicalizeBarrierFromCTA(BarrierOp op,
 LogicalResult BarrierExpectOp::verify() {
   if (failed(verifyBarrierFromCTA(*this, getAlloc(), getFromCTA())))
     return failure();
-  if (getPerWarp()) {
-    int numWarps = gpu::lookupNumWarps(*this);
-    if (numWarps <= 1 || getSize() % numWarps != 0)
-      return emitOpError("per_warp requires multiple warps and size divisible "
-                         "by the warp count");
-  }
   return success();
 }
 
@@ -876,8 +870,6 @@ LogicalResult BarrierExpectOp::canonicalize(BarrierExpectOp op,
     return success();
   return canonicalizeBarrierFromCTA(op, rewriter);
 }
-
-bool BarrierExpectOp::isPerWarp() { return getPerWarp(); }
 
 Value BarrierExpectOp::getPredicateOperand() { return getPred(); }
 
@@ -922,8 +914,6 @@ TypedValue<MemDescType> WaitBarrierOp::getBarrier() { return getAlloc(); }
 LogicalResult ArriveBarrierOp::verify() {
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
-  if (getPerWarp() && gpu::lookupNumWarps(*this) <= 1)
-    return emitOpError("per_warp requires multiple warps");
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");
@@ -965,8 +955,6 @@ LogicalResult ArriveBarrierOp::canonicalize(ArriveBarrierOp op,
     return success();
   return canonicalizeBarrierFromCTA(op, rewriter);
 }
-
-bool ArriveBarrierOp::isPerWarp() { return getPerWarp(); }
 
 Value ArriveBarrierOp::getPredicateOperand() { return getPred(); }
 
