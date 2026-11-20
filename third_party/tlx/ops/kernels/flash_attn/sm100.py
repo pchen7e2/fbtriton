@@ -1474,7 +1474,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         # (NVPTX would sink it after the loop) and the P arrives' lane-0 test inside it (LICM would hoist it). ptxas
         # schedules the softmax loop about 3% faster with both.
         with tlx.async_task(num_warps=4, registers=256 if (USE_2CTA and HEAD_DIM >= 256) else 184,
-                            replicate=NUM_GROUPS_PER_CTA, nvptx_cmp_sink_workaround=True):
+                            replicate=NUM_GROUPS_PER_CTA, nvptx_cmp_sink_workaround=False):
             accum_cnt_qk = 0
             tile_count = 0
             tile_id = start_pid
