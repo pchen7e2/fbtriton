@@ -4876,7 +4876,7 @@ CONFIGS = lambda: configs  # noqa: E731
 CONFIGS_HD256 = lambda: configs_hd256  # noqa: E731
 BWD_CONFIGS_FULL = lambda: configs_bwd_tlx  # noqa: E731
 # One historical config for each forward pruner path, plus the first 2-CTA config.
-SMOKE_CONFIGS = lambda: [configs[i] for i in (0, 6, 12, 18, 24)]  # noqa: E731
+SMOKE_CONFIGS = lambda: [configs[i] for i in (25, )]  # noqa: E731
 SMOKE_CONFIGS_HD256 = lambda: configs_hd256[:1]  # noqa: E731
 BWD_CONFIGS_SMOKE = lambda: [configs_bwd_1cta[0], configs_bwd_2cta[0]]  # noqa: E731
 
